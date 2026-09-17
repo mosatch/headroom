@@ -1563,6 +1563,88 @@
                         </div>
                     </template>
                 </section>
+
+                <!-- Per-host savings. A proxy bound to a LAN address serves
+                     several machines; without this axis they all collapse into
+                     the aggregates above. "Spend" leads on cost rather than
+                     savings because the question this table answers is which
+                     machine is consuming the plan. -->
+                <section class="bg-surface rounded-lg border border-border overflow-hidden mt-6">
+                    <div class="px-4 py-3 border-b border-border flex justify-between items-center">
+                        <div>
+                            <span class="text-sm font-medium text-gray-300">Per-Host Savings</span>
+                            <div class="text-xs text-gray-500 mt-0.5">Lifetime totals — attributed requests only</div>
+                        </div>
+                        <span class="text-xs text-gray-500 font-mono"
+                              x-text="Object.keys(lifetimeStats.hosts || {}).length + ' host(s)'"></span>
+                    </div>
+
+                    <template x-if="Object.keys(lifetimeStats.hosts || {}).length === 0">
+                        <div class="px-4 py-8 text-center">
+                            <div class="text-xs text-gray-500 mb-3">No per-host data yet.</div>
+                            <div class="text-xs text-gray-600 font-mono leading-relaxed">
+                                <span class="text-accent">X-Headroom-Host: &lt;hostname&gt;</span>
+                                <div class="mt-1 font-sans">Sent automatically by <span class="font-mono">headroom wrap</span>; other clients fall back to their address.</div>
+                            </div>
+                        </div>
+                    </template>
+
+                    <template x-if="Object.keys(lifetimeStats.hosts || {}).length > 0">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm" style="table-layout:fixed">
+                                <colgroup>
+                                    <col style="width:22%">
+                                    <col style="width:9%">
+                                    <col style="width:14%">
+                                    <col style="width:11%">
+                                    <col style="width:11%">
+                                    <col style="width:15%">
+                                    <col style="width:18%">
+                                </colgroup>
+                                <thead class="text-xs text-gray-500 tracking-wide">
+                                    <tr>
+                                        <th class="px-4 py-3 font-medium text-left">Host</th>
+                                        <th class="px-4 py-3 font-medium text-right">Requests</th>
+                                        <th class="px-4 py-3 font-medium text-right">Tokens Saved</th>
+                                        <th class="px-4 py-3 font-medium text-right">Saved $</th>
+                                        <th class="px-4 py-3 font-medium text-right">Spend $</th>
+                                        <th class="px-4 py-3 font-medium text-right">Savings %</th>
+                                        <th class="px-4 py-3 font-medium text-right md:table-cell">Last Active</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-border">
+                                    <template x-for="[host, info] in Object.entries(lifetimeStats.hosts || {})" :key="host">
+                                        <tr class="hover:bg-border/30 transition-colors">
+                                            <td class="px-4 py-3 text-left">
+                                                <span class="px-2 py-0.5 bg-border text-xs font-mono" x-text="host"></span>
+                                            </td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums"
+                                                x-text="formatNumber(info.requests || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums text-accent"
+                                                x-text="formatNumber(info.tokens_saved || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums text-emerald-400"
+                                                x-text="'$' + formatCurrency(info.compression_savings_usd || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums text-gray-300"
+                                                x-text="'$' + formatCurrency(info.total_input_cost_usd || 0)"></td>
+                                            <td class="px-4 py-3 text-right">
+                                                <div class="flex items-center justify-end gap-2">
+                                                    <div class="w-16 h-1.5 bg-border rounded-full overflow-hidden">
+                                                        <div class="h-full bg-accent rounded-full"
+                                                             :style="'width:' + Math.min(info.savings_percent || 0, 100) + '%'"></div>
+                                                    </div>
+                                                    <span class="text-accent font-mono tabular-nums text-xs w-10 text-right"
+                                                          x-text="(info.savings_percent || 0).toFixed(1) + '%'"></span>
+                                                </div>
+                                            </td>
+                                            <td class="px-4 py-3 text-right text-xs text-gray-500 font-mono md:table-cell"
+                                                x-text="info.last_activity_at ? new Date(info.last_activity_at).toLocaleString() : '—'"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                </section>
             </div>
         </template>
 

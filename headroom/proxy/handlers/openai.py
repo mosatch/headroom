@@ -82,6 +82,11 @@ from headroom.proxy.buffered_ccr_response import (
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import header_safe_transforms
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
+from headroom.proxy.host_context import (
+    classify_host,
+    get_current_host,
+    set_current_host,
+)
 from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_for
@@ -6815,6 +6820,10 @@ class OpenAIHandlerMixin:
         # /p/<name> path prefix already bound by WebSocketProjectPrefixMiddleware
         # so prefix-only clients (aider, Copilot BYOK, Cursor) stay attributed.
         set_current_project(classify_project(ws_headers) or get_current_project())
+        # Same rebind for the host axis: an explicit X-Headroom-Host header on
+        # the WS upgrade wins, else keep whatever the prefix middleware resolved
+        # from the peer address.
+        set_current_host(classify_host(ws_headers) or get_current_host())
         metrics_for_inbound_ws = getattr(self, "metrics", None)
         if metrics_for_inbound_ws is not None and hasattr(
             metrics_for_inbound_ws, "record_inbound_request"

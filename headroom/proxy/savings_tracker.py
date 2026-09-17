@@ -14,7 +14,7 @@ import math
 import os
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from csv import DictWriter
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -24,6 +24,7 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom.proxy import project_name_policy
+from headroom.proxy.host_policy import sanitize_host_name
 from headroom.proxy.persistent_metrics import PersistentMetricsState
 
 PROJECT_NAME_MAX_LENGTH = project_name_policy.PROJECT_NAME_MAX_LENGTH
@@ -37,6 +38,9 @@ DEFAULT_SAVINGS_FILE = "proxy_savings.json"
 SCHEMA_VERSION = 5
 DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_PROJECTS = 50
+# Hosts are capped like projects. A shared gateway serves a handful of machines
+# where a developer works across many repos, so this is headroom, not a limit.
+DEFAULT_MAX_HOSTS = 50
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
 DEFAULT_MAX_RESPONSE_HISTORY_POINTS = 500
 DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
@@ -516,7 +520,7 @@ def _empty_by_model_entry() -> dict[str, Any]:
     }
 
 
-def _empty_project_entry() -> dict[str, Any]:
+def _empty_attribution_entry() -> dict[str, Any]:
     return {
         "requests": 0,
         "tokens_saved": 0,
@@ -527,15 +531,26 @@ def _empty_project_entry() -> dict[str, Any]:
     }
 
 
-def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
+# Projects and hosts are two attribution axes over the same table shape, so the
+# normalize/record/snapshot trio below is shared rather than copied per axis.
+_empty_project_entry = _empty_attribution_entry
+_empty_host_entry = _empty_attribution_entry
+
+
+def _normalize_attribution_map(
+    raw: Any,
+    *,
+    sanitize: Callable[[Any], str | None],
+    cap: int,
+) -> dict[str, dict[str, Any]]:
     if not isinstance(raw, dict):
         return {}
-    projects: dict[str, dict[str, Any]] = {}
+    buckets: dict[str, dict[str, Any]] = {}
     for name, entry in raw.items():
-        cleaned_name = sanitize_project_name(name)
+        cleaned_name = sanitize(name)
         if cleaned_name is None or not isinstance(entry, dict):
             continue
-        normalized = _empty_project_entry()
+        normalized = _empty_attribution_entry()
         normalized["requests"] = _coerce_int(entry.get("requests"))
         normalized["tokens_saved"] = _coerce_int(entry.get("tokens_saved"))
         normalized["compression_savings_usd"] = round(
@@ -547,17 +562,27 @@ def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
         )
         last_activity = _parse_timestamp(entry.get("last_activity_at"))
         normalized["last_activity_at"] = _to_utc_iso(last_activity) if last_activity else None
-        projects[cleaned_name] = normalized
-    if len(projects) > DEFAULT_MAX_PROJECTS:
+        buckets[cleaned_name] = normalized
+    if len(buckets) > cap:
         # Oversized persisted maps (hand-edited or future versions) would
         # otherwise shrink only one entry per recorded request.
         kept = sorted(
-            projects.items(),
+            buckets.items(),
             key=lambda item: (item[1]["tokens_saved"], item[1]["last_activity_at"] or ""),
             reverse=True,
-        )[:DEFAULT_MAX_PROJECTS]
-        projects = dict(kept)
-    return projects
+        )[:cap]
+        buckets = dict(kept)
+    return buckets
+
+
+def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
+    return _normalize_attribution_map(
+        raw, sanitize=sanitize_project_name, cap=DEFAULT_MAX_PROJECTS
+    )
+
+
+def _normalize_hosts(raw: Any) -> dict[str, dict[str, Any]]:
+    return _normalize_attribution_map(raw, sanitize=sanitize_host_name, cap=DEFAULT_MAX_HOSTS)
 
 
 def _normalize_by_model(raw: Any) -> dict[str, dict[str, Any]]:
@@ -761,6 +786,7 @@ class SavingsTracker:
         output_tokens_saved: int = 0,
         provider: str | None = None,
         project: str | None = None,
+        host: str | None = None,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
         uncached_input_tokens: int = 0,
@@ -936,6 +962,16 @@ class SavingsTracker:
                 input_cost_usd_delta=delta_input_cost_usd,
             )
 
+            self._record_host_locked(
+                host,
+                timestamp_dt=timestamp_dt,
+                requests_delta=1,
+                tokens_saved_delta=delta_tokens_saved,
+                savings_usd_delta=delta_savings_usd,
+                input_tokens_delta=delta_input_tokens,
+                input_cost_usd_delta=delta_input_cost_usd,
+            )
+
             # In --mode cache, headroom's own compression (tokens_saved) is
             # near-always 0 by design — the frozen prefix is byte-replayed,
             # not lossy-compressed, to keep Bedrock's prompt cache warm. Gating
@@ -1031,10 +1067,13 @@ class SavingsTracker:
             self._persistent_metrics.record_cache_miss(provider=provider, reason=reason)
             self._maybe_save_locked()
 
-    def _record_project_locked(
+    def _record_attribution_locked(
         self,
-        project: str | None,
+        value: str | None,
         *,
+        bucket_key: str,
+        sanitize: Callable[[Any], str | None],
+        cap: int,
         timestamp_dt: datetime,
         requests_delta: int = 0,
         tokens_saved_delta: int = 0,
@@ -1042,17 +1081,17 @@ class SavingsTracker:
         input_tokens_delta: int = 0,
         input_cost_usd_delta: float = 0.0,
     ) -> None:
-        """Accumulate per-project savings. Caller must hold ``self._lock``.
+        """Accumulate savings on one attribution axis. Caller holds ``self._lock``.
 
-        Unattributed traffic (``project`` missing or unusable) is skipped so
-        existing aggregate behavior is unchanged. The map is capped at
-        ``DEFAULT_MAX_PROJECTS`` entries, evicting the smallest/oldest bucket.
+        Unattributed traffic (``value`` missing or unusable) is skipped so
+        existing aggregate behavior is unchanged. The map is capped at ``cap``
+        entries, evicting the smallest/oldest bucket.
         """
-        name = sanitize_project_name(project)
+        name = sanitize(value)
         if name is None:
             return
-        projects: dict[str, dict[str, Any]] = self._state.setdefault("projects", {})
-        entry = projects.setdefault(name, _empty_project_entry())
+        buckets: dict[str, dict[str, Any]] = self._state.setdefault(bucket_key, {})
+        entry = buckets.setdefault(name, _empty_attribution_entry())
         entry["requests"] += max(requests_delta, 0)
         entry["tokens_saved"] += max(tokens_saved_delta, 0)
         entry["compression_savings_usd"] = round(
@@ -1063,15 +1102,35 @@ class SavingsTracker:
             entry["total_input_cost_usd"] + max(input_cost_usd_delta, 0.0), 6
         )
         entry["last_activity_at"] = _to_utc_iso(timestamp_dt)
-        if len(projects) > DEFAULT_MAX_PROJECTS:
+        if len(buckets) > cap:
             evict = min(
-                (key for key in projects if key != name),
+                (key for key in buckets if key != name),
                 key=lambda key: (
-                    projects[key]["tokens_saved"],
-                    projects[key]["last_activity_at"] or "",
+                    buckets[key]["tokens_saved"],
+                    buckets[key]["last_activity_at"] or "",
                 ),
             )
-            del projects[evict]
+            del buckets[evict]
+
+    def _record_project_locked(self, project: str | None, **deltas: Any) -> None:
+        """Accumulate per-project savings. Caller must hold ``self._lock``."""
+        self._record_attribution_locked(
+            project,
+            bucket_key="projects",
+            sanitize=sanitize_project_name,
+            cap=DEFAULT_MAX_PROJECTS,
+            **deltas,
+        )
+
+    def _record_host_locked(self, host: str | None, **deltas: Any) -> None:
+        """Accumulate per-host savings. Caller must hold ``self._lock``."""
+        self._record_attribution_locked(
+            host,
+            bucket_key="hosts",
+            sanitize=sanitize_host_name,
+            cap=DEFAULT_MAX_HOSTS,
+            **deltas,
+        )
 
     def _record_by_model_locked(
         self,
@@ -1103,11 +1162,11 @@ class SavingsTracker:
             entry["total_input_cost_usd"] + max(input_cost_usd_delta, 0.0), 6
         )
 
-    def _projects_snapshot_locked(self) -> dict[str, dict[str, Any]]:
-        """Per-project stats with a derived ``savings_percent``, sorted by savings."""
-        projects = self._state.get("projects", {})
+    def _attribution_snapshot_locked(self, bucket_key: str) -> dict[str, dict[str, Any]]:
+        """Per-bucket stats with a derived ``savings_percent``, sorted by savings."""
+        buckets = self._state.get(bucket_key, {})
         ranked = sorted(
-            projects.items(),
+            buckets.items(),
             key=lambda item: item[1]["tokens_saved"],
             reverse=True,
         )
@@ -1121,6 +1180,14 @@ class SavingsTracker:
             )
             result[name] = view
         return result
+
+    def _projects_snapshot_locked(self) -> dict[str, dict[str, Any]]:
+        """Per-project stats with a derived ``savings_percent``, sorted by savings."""
+        return self._attribution_snapshot_locked("projects")
+
+    def _hosts_snapshot_locked(self) -> dict[str, dict[str, Any]]:
+        """Per-host stats with a derived ``savings_percent``, sorted by savings."""
+        return self._attribution_snapshot_locked("hosts")
 
     def _by_model_snapshot_locked(self) -> dict[str, dict[str, Any]]:
         """Per-model stats ranked by savings."""
@@ -1169,6 +1236,7 @@ class SavingsTracker:
                 }
             )
             response["projects"] = self._projects_snapshot_locked()
+            response["hosts"] = self._hosts_snapshot_locked()
             return response
 
     def stats_preview(self, recent_points: int = 20) -> dict[str, Any]:
@@ -1185,6 +1253,8 @@ class SavingsTracker:
             "retention": snapshot["retention"],
             "projects": snapshot["projects"],
             "projects_limit": DEFAULT_MAX_PROJECTS,
+            "hosts": snapshot["hosts"],
+            "hosts_limit": DEFAULT_MAX_HOSTS,
             "by_model": snapshot["by_model"],
         }
 
@@ -1215,6 +1285,7 @@ class SavingsTracker:
             },
             "retention": snapshot["retention"],
             "projects": snapshot["projects"],
+            "hosts": snapshot["hosts"],
             "by_model": snapshot["by_model"],
             "history_summary": {
                 "mode": history_mode,
@@ -1282,6 +1353,7 @@ class SavingsTracker:
                     "max_response_history_points": self._max_response_history_points,
                 },
                 "projects": self._projects_snapshot_locked(),
+                "hosts": self._hosts_snapshot_locked(),
                 "by_model": self._by_model_snapshot_locked(),
             }
 
@@ -1300,6 +1372,7 @@ class SavingsTracker:
             "display_session": _empty_display_session(),
             "history": [],
             "projects": {},
+            "hosts": {},
             "by_model": {},
         }
 
@@ -1400,6 +1473,7 @@ class SavingsTracker:
             "display_session": _normalize_display_session(raw.get("display_session")),
             "history": normalized_history,
             "projects": _normalize_projects(raw.get("projects")),
+            "hosts": _normalize_hosts(raw.get("hosts")),
             "by_model": _normalize_by_model(raw.get("by_model")),
         }
         raw_lifetime_metrics = raw.get("lifetime_metrics")
@@ -1568,6 +1642,7 @@ class SavingsTracker:
                 "display_session": self._state["display_session"],
                 "history": self._state["history"],
                 "projects": self._state.get("projects", {}),
+                "hosts": self._state.get("hosts", {}),
                 "by_model": self._state.get("by_model", {}),
                 "lifetime_metrics": lifetime_metrics,
             }

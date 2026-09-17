@@ -146,6 +146,7 @@ from headroom.proxy.helpers import (
     resolve_display_provider,
     retry_after_ms,
 )
+from headroom.proxy.host_context import bind_host_from_request
 from headroom.proxy.loop_callback_failure_policy import is_known_websocket_callback_failure
 from headroom.proxy.loopback_guard import is_loopback_host
 from headroom.proxy.malloc_trim import trim_periodically
@@ -2851,6 +2852,9 @@ class WebSocketProjectPrefixMiddleware:
                 name.decode("latin-1"): value.decode("latin-1") for name, value in scope["headers"]
             }
             set_current_project(classify_project(headers) or prefix_project)
+            # ASGI gives the WS peer as a (host, port) pair under "client".
+            ws_client = scope.get("client") or ()
+            bind_host_from_request(headers, ws_client[0] if ws_client else None)
         await self.app(scope, receive, send)
 
 
@@ -3615,10 +3619,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             request.scope["headers"].append((b"x-client", b"codex"))
         client = getattr(request, "client", None)
         client_addr = ""
+        client_host = None
         if client is not None:
             client_host = getattr(client, "host", None)
             client_port = getattr(client, "port", None)
             client_addr = f"{client_host}:{client_port}" if client_port else str(client_host)
+        # Host attribution: an explicit X-Headroom-Host header wins, else the
+        # peer address with this machine's own addresses folded onto its
+        # hostname. Bound after the peer address is known, and after the codex
+        # stamp so both reads see the same header mapping.
+        bind_host_from_request(headers, client_host)
         try:
             proxy.metrics.record_inbound_request(method=method, path=path)
         except Exception:
@@ -4521,6 +4531,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "savings": {
                 "total_tokens": total_tokens_all_layers,
                 "per_project": persistent_savings.get("projects", {}),
+                "per_host": persistent_savings.get("hosts", {}),
                 # Attribution only: these rows explain the canonical headline
                 # and are not added to it again.
                 "by_source": sorted(
@@ -4917,6 +4928,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         if not include_sensitive:
             payload.pop("projects", None)
+            # Host names identify machines on the operator's network, so they
+            # are gated exactly like project names rather than served to any
+            # caller that can reach the port.
+            payload.pop("hosts", None)
             persistence = payload.get("persistence")
             if isinstance(persistence, dict):
                 payload["persistence"] = {**persistence, "error": None}

@@ -217,6 +217,7 @@ class RequestOutcome:
     tags: dict[str, Any] = field(default_factory=dict)
     client: str | None = None
     project: str | None = None
+    host: str | None = None
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
 
@@ -474,6 +475,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     """
     from headroom.copilot_auth import consume_request_routed_to_copilot
     from headroom.proxy.cost import _summarize_transforms
+    from headroom.proxy.host_context import get_current_host
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
     from headroom.proxy.savings_attribution import (
@@ -588,6 +590,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
 
+    # Host attribution: same contract as project above. The middleware / WS
+    # accept resolved it from ``X-Headroom-Host`` (or the peer address), so a
+    # shared gateway can split its aggregates by the machine that called it.
+    host = outcome.host or get_current_host()
+
     # Savings that are new to this conversation. Per-request descriptions
     # below keep ``outcome.tokens_saved`` -- the wire truth for THIS request --
     # while everything that accumulates across turns uses this, so a removed
@@ -651,6 +658,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         attempted_input_tokens=outcome.attempted_input_tokens,
         output_tokens_saved=output_tokens_saved_est,
         project=project,
+        host=host,
         client=outcome.client,
         tool_search_saved=tool_search_saved,
         local_input_tokens=outcome.optimized_tokens,
@@ -689,6 +697,8 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             log_tags["client"] = outcome.client
         if project:
             log_tags["project"] = project
+        if host:
+            log_tags["host"] = host
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,

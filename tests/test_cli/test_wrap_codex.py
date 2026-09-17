@@ -940,7 +940,10 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         assert content.count("[model_providers.headroom]") == 1
         assert content.count("env_http_headers") == 1
         assert 'base_url = "http://127.0.0.1:8787/v1"' in content
-        assert 'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }' in content
+        assert (
+            'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT", '
+            '"X-Headroom-Host" = "HEADROOM_HOST" }'
+        ) in content
         assert "[profiles.default]" in content
         assert 'model = "gpt-5"' in content
 
@@ -1883,16 +1886,17 @@ def test_unwrap_codex_preserves_unrelated_sections(
 
 
 # ---------------------------------------------------------------------------
-# Per-project savings: env_http_headers in the injected provider block
+# Per-project / per-host savings: env_http_headers in the injected provider block
 # ---------------------------------------------------------------------------
 
 
 class TestCodexProjectHeaderConfig:
-    """The injected provider maps X-Headroom-Project to HEADROOM_PROJECT.
+    """The injected provider maps the attribution headers to env vars.
 
     Codex's ``env_http_headers`` sends a header only when the mapped env var
     is set at Codex runtime, so `headroom wrap codex` exports
-    ``HEADROOM_PROJECT`` and the proxy attributes savings per project.
+    ``HEADROOM_PROJECT`` and ``HEADROOM_HOST``; the proxy then attributes
+    savings per project and per host.
     """
 
     def test_inject_writes_env_http_headers_mapping(
@@ -1903,7 +1907,10 @@ class TestCodexProjectHeaderConfig:
         wrap_mod._inject_codex_provider_config(8787)
 
         content = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
-        assert 'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }' in content
+        assert (
+            'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT", '
+            '"X-Headroom-Host" = "HEADROOM_HOST" }'
+        ) in content
 
     def test_env_http_headers_inside_provider_section(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

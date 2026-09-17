@@ -2683,6 +2683,9 @@ def _codex_session_launch_settings(
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project
+    host_label = _host_name_for_header()
+    if host_label and "HEADROOM_HOST" not in env:
+        env["HEADROOM_HOST"] = host_label
     config_args = tuple(item for override in overrides for item in ("--config", override))
     return (*config_args, *codex_args), env, display
 
@@ -2907,6 +2910,12 @@ def _snapshot_codex_config_if_unwrapped(config_file: Path, backup_file: Path) ->
 # case-insensitively by headroom.proxy.project_context.PROJECT_HEADER).
 _PROJECT_HEADER_NAME = "X-Headroom-Project"
 
+# Canonical casing for the per-host savings header (matched case-insensitively
+# by headroom.proxy.host_policy.HOST_HEADER). A proxy bound to a LAN address
+# serves several machines, and without this every one of them lands in the same
+# bucket; the client is the only party that reliably knows its own name.
+_HOST_HEADER_NAME = "X-Headroom-Host"
+
 
 def _project_name_from_cwd() -> str | None:
     """Project label for X-Headroom-Project: basename of the launch directory.
@@ -2921,29 +2930,53 @@ def _project_name_from_cwd() -> str | None:
     return urllib.parse.quote(name, safe="-_.() ")
 
 
-def _apply_project_header_env(env: dict[str, str]) -> None:
-    """Inject X-Headroom-Project into ``ANTHROPIC_CUSTOM_HEADERS``.
+def _host_name_for_header() -> str | None:
+    """Host label for X-Headroom-Host: this machine's own hostname.
+
+    Percent-encoded on the same rationale as the project label. The proxy
+    lowercases and strips a ``.local`` suffix in sanitize_host_name, so the
+    spelling the platform happens to report does not fork the bucket.
+    """
+    try:
+        name = socket.gethostname().strip()
+    except Exception:
+        return None
+    if not name:
+        return None
+    return urllib.parse.quote(name, safe="-_.() ")
+
+
+def _apply_custom_header_env(env: dict[str, str], header_name: str, value: str | None) -> None:
+    """Append one ``Name: value`` line to ``ANTHROPIC_CUSTOM_HEADERS``.
 
     Claude Code reads ``ANTHROPIC_CUSTOM_HEADERS`` as newline-separated
-    ``Name: value`` lines and attaches them to every API request; the
-    Headroom proxy uses the X-Headroom-Project header for per-project
-    savings attribution.  An existing user-supplied x-headroom-project
-    header (any casing) always wins — we never duplicate or overwrite it,
-    and any other user headers are preserved by appending.
+    ``Name: value`` lines and attaches them to every API request.  An existing
+    user-supplied header of the same name (any casing) always wins — we never
+    duplicate or overwrite it, and any other user headers are preserved by
+    appending.
     """
-    project = _project_name_from_cwd()
-    if not project:
+    if not value:
         return
-    header_line = f"{_PROJECT_HEADER_NAME}: {project}"
+    header_line = f"{header_name}: {value}"
     existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
     if existing:
         for line in existing.splitlines():
             name = line.split(":", 1)[0].strip()
-            if name.lower() == _PROJECT_HEADER_NAME.lower():
+            if name.lower() == header_name.lower():
                 return  # user override wins
         env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}"
     else:
         env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
+
+
+def _apply_project_header_env(env: dict[str, str]) -> None:
+    """Inject X-Headroom-Project for per-project savings attribution."""
+    _apply_custom_header_env(env, _PROJECT_HEADER_NAME, _project_name_from_cwd())
+
+
+def _apply_host_header_env(env: dict[str, str]) -> None:
+    """Inject X-Headroom-Host for per-host savings attribution."""
+    _apply_custom_header_env(env, _HOST_HEADER_NAME, _host_name_for_header())
 
 
 # Codex's own built-in providers plus Headroom's injected one — never treated
@@ -3109,7 +3142,12 @@ def _inject_codex_provider_config(port: int) -> str | None:
     # codex`) exists at Codex runtime. When a custom upstream was detected,
     # add a second entry so Codex also sends X-Headroom-Base-Url — the proxy
     # forwards there instead of api.openai.com (#1614).
-    env_http_headers_map = {_PROJECT_HEADER_NAME: "HEADROOM_PROJECT"}
+    env_http_headers_map = {
+        _PROJECT_HEADER_NAME: "HEADROOM_PROJECT",
+        # Per-host savings, same mechanism: HEADROOM_HOST is exported by
+        # `headroom wrap codex` so a shared proxy can attribute this machine.
+        _HOST_HEADER_NAME: "HEADROOM_HOST",
+    }
     if custom_upstream_base_url:
         env_http_headers_map[_UPSTREAM_BASE_URL_HEADER_NAME] = _UPSTREAM_BASE_URL_ENV_VAR
     env_http_headers_toml = ", ".join(f'"{k}" = "{v}"' for k, v in env_http_headers_map.items())
@@ -5414,6 +5452,11 @@ def claude(
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
+
+        # Per-host savings attribution: tag every request with this machine's
+        # name via X-Headroom-Host, so a proxy shared across a LAN can tell its
+        # callers apart (user override wins).
+        _apply_host_header_env(env)
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
