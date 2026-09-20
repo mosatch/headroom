@@ -942,7 +942,7 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         assert 'base_url = "http://127.0.0.1:8787/v1"' in content
         assert (
             'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT", '
-            '"X-Headroom-Host" = "HEADROOM_HOST" }'
+            '"X-Headroom-Host" = "HEADROOM_HOST_LABEL" }'
         ) in content
         assert "[profiles.default]" in content
         assert 'model = "gpt-5"' in content
@@ -1895,7 +1895,7 @@ class TestCodexProjectHeaderConfig:
 
     Codex's ``env_http_headers`` sends a header only when the mapped env var
     is set at Codex runtime, so `headroom wrap codex` exports
-    ``HEADROOM_PROJECT`` and ``HEADROOM_HOST``; the proxy then attributes
+    ``HEADROOM_PROJECT`` and ``HEADROOM_HOST_LABEL``; the proxy then attributes
     savings per project and per host.
     """
 
@@ -1909,7 +1909,7 @@ class TestCodexProjectHeaderConfig:
         content = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
         assert (
             'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT", '
-            '"X-Headroom-Host" = "HEADROOM_HOST" }'
+            '"X-Headroom-Host" = "HEADROOM_HOST_LABEL" }'
         ) in content
 
     def test_env_http_headers_inside_provider_section(

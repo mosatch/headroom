@@ -2684,8 +2684,8 @@ def _codex_session_launch_settings(
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project
     host_label = _host_name_for_header()
-    if host_label and "HEADROOM_HOST" not in env:
-        env["HEADROOM_HOST"] = host_label
+    if host_label and "HEADROOM_HOST_LABEL" not in env:
+        env["HEADROOM_HOST_LABEL"] = host_label
     config_args = tuple(item for override in overrides for item in ("--config", override))
     return (*config_args, *codex_args), env, display
 
@@ -3144,9 +3144,12 @@ def _inject_codex_provider_config(port: int) -> str | None:
     # forwards there instead of api.openai.com (#1614).
     env_http_headers_map = {
         _PROJECT_HEADER_NAME: "HEADROOM_PROJECT",
-        # Per-host savings, same mechanism: HEADROOM_HOST is exported by
+        # Per-host savings, same mechanism: HEADROOM_HOST_LABEL is exported by
         # `headroom wrap codex` so a shared proxy can attribute this machine.
-        _HOST_HEADER_NAME: "HEADROOM_HOST",
+        # Deliberately NOT ``HEADROOM_HOST`` — that is the proxy's own bind
+        # address (cli/proxy.py --host), and reusing it would make a proxy
+        # launched from this environment try to bind to the machine's name.
+        _HOST_HEADER_NAME: "HEADROOM_HOST_LABEL",
     }
     if custom_upstream_base_url:
         env_http_headers_map[_UPSTREAM_BASE_URL_HEADER_NAME] = _UPSTREAM_BASE_URL_ENV_VAR
