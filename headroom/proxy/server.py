@@ -111,6 +111,10 @@ from headroom.providers.registry import (
     resolve_api_targets,
 )
 from headroom.proxy import runtime_env
+from headroom.proxy.attribution_policy import (
+    attribution_error_payload,
+    missing_attribution,
+)
 from headroom.proxy.audit import is_auditable_path, record_admin_action
 from headroom.proxy.auth_mode import should_stamp_codex_client
 from headroom.proxy.background_compression import BackgroundCompressor
@@ -2842,8 +2846,16 @@ class WebSocketAuthMiddleware:
 class WebSocketProjectPrefixMiddleware:
     """Normalize project-prefixed WebSocket paths before route matching."""
 
-    def __init__(self, app: Any) -> None:
+    def __init__(
+        self,
+        app: Any,
+        *,
+        require_project: bool = False,
+        require_host: bool = False,
+    ) -> None:
         self.app = app
+        self.require_project = require_project
+        self.require_host = require_host
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "websocket":
@@ -2855,6 +2867,31 @@ class WebSocketProjectPrefixMiddleware:
             # ASGI gives the WS peer as a (host, port) pair under "client".
             ws_client = scope.get("client") or ()
             bind_host_from_request(headers, ws_client[0] if ws_client else None)
+            # Enforcement has to refuse the upgrade here too: a WS session
+            # bypasses the HTTP middleware entirely, so leaving it out would
+            # make Codex responses-WS the one transport that can still spend
+            # tokens anonymously.
+            if self.require_project or self.require_host:
+                missing = missing_attribution(
+                    headers,
+                    path=scope.get("path", ""),
+                    require_project=self.require_project,
+                    require_host=self.require_host,
+                    prefix_project=prefix_project,
+                )
+                if missing:
+                    logger.warning(
+                        "event=proxy_attribution_refused transport=websocket path=%s missing=%s",
+                        scope.get("path"),
+                        ",".join(missing),
+                    )
+                    # Same close-before-accept dance as the auth gate above:
+                    # answering the connect with a close is what refuses the
+                    # upgrade on the wire rather than accepting then dropping.
+                    message = await receive()
+                    if message["type"] == "websocket.connect":
+                        await send({"type": "websocket.close", "code": 1008})
+                    return
         await self.app(scope, receive, send)
 
 
@@ -3125,7 +3162,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
-    app.add_middleware(WebSocketProjectPrefixMiddleware)
+    app.add_middleware(
+        WebSocketProjectPrefixMiddleware,
+        require_project=config.require_project_attribution,
+        require_host=config.require_host_attribution,
+    )
     loop_health_state: LoopHealthState = {
         "status": "healthy",
         "known_failures": 0,
@@ -3629,6 +3670,29 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # hostname. Bound after the peer address is known, and after the codex
         # stamp so both reads see the same header mapping.
         bind_host_from_request(headers, client_host)
+        # Optional enforcement. Checked here — after both axes are bound and
+        # before any upstream work — so a refusal costs nothing and the
+        # rejected request still carries whatever attribution it did supply
+        # into the log line below.
+        if config.require_project_attribution or config.require_host_attribution:
+            missing = missing_attribution(
+                headers,
+                path=path,
+                require_project=config.require_project_attribution,
+                require_host=config.require_host_attribution,
+                prefix_project=prefix_project,
+            )
+            if missing:
+                logger.warning(
+                    "event=proxy_attribution_refused path=%s client=%s missing=%s",
+                    path,
+                    client_addr,
+                    ",".join(missing),
+                )
+                return JSONResponse(
+                    status_code=400,
+                    content=attribution_error_payload(missing),
+                )
         try:
             proxy.metrics.record_inbound_request(method=method, path=path)
         except Exception:

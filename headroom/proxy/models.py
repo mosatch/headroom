@@ -339,6 +339,16 @@ class ProxyConfig:
     # usage breakdown) does to budget enforcement. See budget_basis_policy.
     budget_estimated_basis: Literal["count", "ignore", "block"] = "count"
 
+    # Attribution enforcement (shared-gateway deployments). Off by default:
+    # the single-user local proxy has nothing to tell apart, and refusing
+    # unattributed traffic there would only break working setups. When on, a
+    # request to any non-operational path must carry the named header or it is
+    # refused with 400 — see headroom.proxy.attribution_policy.
+    # CLI: --require-project-attribution / --require-host-attribution;
+    # env: HEADROOM_REQUIRE_PROJECT_ATTRIBUTION / HEADROOM_REQUIRE_HOST_ATTRIBUTION.
+    require_project_attribution: bool = False
+    require_host_attribution: bool = False
+
     # Logging
     log_requests: bool = True
     log_file: str | None = None

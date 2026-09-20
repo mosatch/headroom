@@ -728,6 +728,31 @@ def dashboard(port: int, no_open: bool) -> None:
     is_flag=True,
     help="Disable Read lifecycle management (stale/superseded Read compression)",
 )
+# Attribution enforcement — for shared gateways, OFF by default
+@click.option(
+    "--require-project-attribution",
+    is_flag=True,
+    envvar="HEADROOM_REQUIRE_PROJECT_ATTRIBUTION",
+    help=(
+        "Refuse requests that carry no X-Headroom-Project header and no "
+        "/p/<name> base-URL prefix. For shared gateways, where unattributed "
+        "traffic makes the per-project table incomplete. Health, dashboard, "
+        "stats and metrics endpoints are never affected. "
+        "env: HEADROOM_REQUIRE_PROJECT_ATTRIBUTION=1."
+    ),
+)
+@click.option(
+    "--require-host-attribution",
+    is_flag=True,
+    envvar="HEADROOM_REQUIRE_HOST_ATTRIBUTION",
+    help=(
+        "Refuse requests that carry no X-Headroom-Host header. Note this "
+        "requires the header specifically: the peer-address fallback would "
+        "otherwise satisfy every request and make the option a no-op. "
+        "`headroom wrap` sends the header automatically. "
+        "env: HEADROOM_REQUIRE_HOST_ATTRIBUTION=1."
+    ),
+)
 # Read maturation (Mechanism B) — experimental, OFF by default
 @click.option(
     "--read-maturation",
@@ -1074,6 +1099,8 @@ def proxy(
     disable_kompress_openai: bool | None,
     code_graph: bool,
     no_read_lifecycle: bool,
+    require_project_attribution: bool,
+    require_host_attribution: bool,
     read_maturation: bool,
     read_maturation_quiesce_turns: int,
     read_maturation_max_hold_turns: int,
@@ -1430,6 +1457,9 @@ def proxy(
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
         read_lifecycle=not no_read_lifecycle,
+        # Attribution enforcement: OFF by default (shared-gateway opt-in)
+        require_project_attribution=require_project_attribution,
+        require_host_attribution=require_host_attribution,
         # Read maturation (Mechanism B): experimental, OFF by default
         read_maturation=rollout_snapshot.is_enabled("read_maturation"),
         read_maturation_quiesce_turns=read_maturation_quiesce_turns,
