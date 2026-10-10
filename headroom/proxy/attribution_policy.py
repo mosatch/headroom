@@ -67,6 +67,9 @@ OPERATIONAL_PATH_PREFIXES: tuple[str, ...] = (
     "/v1/feedback",
     "/v1/telemetry",
     "/v1/toin",
+    # Anthropic's connectivity canary, forwarded upstream: a reachability probe,
+    # not billable traffic, and refusing it reads as "proxy unreachable".
+    "/api/hello",
     # OpenAPI/docs, served by FastAPI itself.
     "/docs",
     "/redoc",

@@ -117,7 +117,10 @@ def test_funnel_attributes_savings_from_context_and_stats_exposes_them(tmp_path,
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "savings.json"))
     config = ProxyConfig(cache_enabled=False, rate_limit_enabled=False, log_requests=False)
 
-    with TestClient(create_app(config)) as client:
+    # /stats-history is an operator route, answered to loopback and trusted CIDRs only.
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
         proxy = client.app.state.proxy
 
         set_current_host("ctx-host")
