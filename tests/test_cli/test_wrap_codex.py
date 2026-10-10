@@ -1246,7 +1246,8 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         assert content.count("env_http_headers") == 1  # inline form from the injection
         assert parsed["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:8787/v1"
         assert parsed["model_providers"]["headroom"]["env_http_headers"] == {
-            "X-Headroom-Project": "HEADROOM_PROJECT"
+            "X-Headroom-Project": "HEADROOM_PROJECT",
+            "X-Headroom-Host": "HEADROOM_HOST_LABEL",
         }
         assert parsed["profiles"]["default"]["model"] == "gpt-5"
         assert parsed["notice"] == {"hide_rate_limit_model_nudge": True}
