@@ -469,6 +469,27 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Only hold/mature Read outputs at least this many bytes.",
         tier="advanced",
     ),
+    # --- Attribution ---
+    SettingField(
+        "HEADROOM_REQUIRE_PROJECT_ATTRIBUTION",
+        "require_project_attribution",
+        "Require project attribution",
+        "Attribution",
+        "bool",
+        default=False,
+        help="Refuse requests with no X-Headroom-Project header or /p/<name> prefix.",
+        tier="advanced",
+    ),
+    SettingField(
+        "HEADROOM_REQUIRE_HOST_ATTRIBUTION",
+        "require_host_attribution",
+        "Require host attribution",
+        "Attribution",
+        "bool",
+        default=False,
+        help="Refuse requests with no X-Headroom-Host header.",
+        tier="advanced",
+    ),
     # --- Extensions ---
     SettingField(
         "HEADROOM_PROXY_EXTENSIONS",
