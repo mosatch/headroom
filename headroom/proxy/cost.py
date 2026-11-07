@@ -11,7 +11,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import math
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -514,6 +514,10 @@ def build_prefix_cache_stats(
             "totals": _miss_totals,
             "by_provider": _miss_by_provider,
         },
+        "cold_coalesce": {
+            "waits": getattr(metrics, "cold_coalesce_waits_total", 0),
+            "wait_seconds": round(getattr(metrics, "cold_coalesce_wait_seconds_total", 0.0), 3),
+        },
         "prefix_freeze": {
             "busts_avoided": metrics.prefix_freeze_busts_avoided,
             "tokens_preserved": metrics.prefix_freeze_tokens_preserved,
@@ -645,6 +649,7 @@ def build_session_summary(
         "no_compressible_content": 0,
         "unknown_token_accounting": 0,
     }
+    passthrough_reasons: dict[str, int] = defaultdict(int)
 
     def _entry_has_number(entry: Any, attr: str) -> bool:
         value = getattr(entry, attr, None)
@@ -687,10 +692,35 @@ def build_session_summary(
             elif not has_complete_token_accounting:
                 uncompressed_reasons["unknown_token_accounting"] += 1
             elif input_tokens_original > 0:
-                # Categorize why it wasn't compressed
+                # Categorize why it wasn't compressed. The handler tags what
+                # was eligible: ``passthrough_reason`` when compression was
+                # skipped outright, and ``compression_scope`` ("full",
+                # "delta" or "frozen") for how much of the history the
+                # pipeline could touch. Without those tags an empty
+                # transforms list is still read as "all frozen", which in
+                # cache mode mislabels a turn whose new tail simply had
+                # nothing to fold.
                 transforms = entry.transforms_applied or []
-                if not transforms:
-                    # Pipeline returned unchanged — likely all frozen
+                entry_tags = getattr(entry, "tags", None)
+                if not isinstance(entry_tags, dict):
+                    entry_tags = {}
+                passthrough_reason = entry_tags.get("passthrough_reason")
+                scope = entry_tags.get("compression_scope")
+                if passthrough_reason:
+                    uncompressed_reasons["passthrough"] += 1
+                    passthrough_reasons[str(passthrough_reason)] += 1
+                elif scope == "frozen":
+                    uncompressed_reasons["prefix_frozen"] += 1
+                elif scope in ("full", "delta"):
+                    # The pipeline saw eligible content and saved nothing;
+                    # the frozen prefix is not the reason.
+                    if input_tokens_original < 500:
+                        uncompressed_reasons["too_small"] += 1
+                    else:
+                        uncompressed_reasons["no_compressible_content"] += 1
+                elif not transforms:
+                    # Legacy entries without scope tags: unchanged pipeline
+                    # output most likely means the history was all frozen.
                     uncompressed_reasons["prefix_frozen"] += 1
                 elif all("excluded" in t or "protected" in t for t in transforms):
                     uncompressed_reasons["no_compressible_content"] += 1
@@ -796,11 +826,18 @@ def build_session_summary(
             # Tool-schema deferral / turn-hook tool shrink, tracked apart from
             # message compression, so consumers can see the full picture.
             "tool_schema_tokens_saved": getattr(metrics, "tool_search_saved_total", 0),
+            # Who deferred on each request. A client that defers for itself
+            # leaves tool_schema_tokens_saved at 0 by design; this says so.
+            "tool_search_modes": dict(getattr(metrics, "tool_search_mode_counts", {}) or {}),
+            "tool_schema_tokens_deferred_by_client": getattr(
+                metrics, "tool_search_client_deferred_tokens_total", 0
+            ),
             "total_tokens_saved_all_layers": (
                 metrics.tokens_saved_total + getattr(metrics, "tool_search_saved_total", 0)
             ),
         },
         "uncompressed_requests": {k: v for k, v in uncompressed_reasons.items() if v > 0},
+        "passthrough_reasons": dict(passthrough_reasons),
         "cost": {
             "without_headroom_usd": round(cost_without, 2),
             "with_headroom_usd": round(cost_with, 2),

@@ -154,7 +154,7 @@ def _format_session_summary(
         reason_labels = {
             "prefix_frozen": "Prefix-frozen (cached by provider)",
             "too_small": "Too small (< 500 tokens)",
-            "passthrough": "Passthrough (token counting)",
+            "passthrough": "Passthrough (token counting, cache-mode skips)",
             "no_compressible_content": "No compressible content (user/assistant only)",
             "unknown_token_accounting": "Unknown token accounting",
         }

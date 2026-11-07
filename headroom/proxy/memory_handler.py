@@ -2166,6 +2166,8 @@ To SAVE: create /memories/<topic>.txt "content"
             "initialized": self._initialized,
             "native_tool": self.config.use_native_tool,
             "bridge_enabled": self.config.bridge_enabled,
+            "inject_context": self.config.inject_context,
+            "mode": getattr(self.config.mode, "value", str(self.config.mode)),
         }
 
     async def close(self) -> None:

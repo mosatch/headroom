@@ -581,3 +581,11 @@ def test_streaming_parser_reads_ttl_buckets_sent_only_in_message_delta() -> None
     assert usage["cache_creation_input_tokens"] == 1000
     assert usage["cache_creation_ephemeral_1h_input_tokens"] == 1000
     assert usage["cache_creation_ephemeral_5m_input_tokens"] == 0
+
+
+def test_prefix_cache_stats_include_cold_coalesce_waits() -> None:
+    metrics = PrometheusMetrics()
+    asyncio.run(metrics.record_cold_coalesce_wait(1.25))
+    asyncio.run(metrics.record_cold_coalesce_wait(0.5))
+    stats = build_prefix_cache_stats(metrics, None)
+    assert stats["cold_coalesce"] == {"waits": 2, "wait_seconds": 1.75}

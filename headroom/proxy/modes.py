@@ -50,3 +50,24 @@ def read_maturation_inert_reason(
     if is_cache_mode(mode) and quiesce_turns > 0 and max_hold_turns > 0:
         return "cache mode freezes a Read before it can quiesce"
     return None
+
+
+def memory_context_inert_reason(
+    mode: str | None, *, inject_context: bool, memory_mode: str | None
+) -> str | None:
+    """Why memory context injection can never happen under ``mode``, else None.
+
+    Cache mode never appends retrieved memories (the next turn's prefix must
+    stay byte-equal to this one), so ``--memory`` in its default auto-tail
+    mode only injects the memory tool schemas and executes the calls the
+    model chooses to make. A deployment that expected retrieved context in
+    the prompt is paying the schema bytes for nothing it will see. ``tool``
+    mode asks for exactly that behaviour, so it is not inert.
+    """
+    if not inject_context:
+        return None
+    if str(memory_mode or "").lower() == "tool":
+        return None
+    if is_cache_mode(mode):
+        return "cache mode never appends retrieved memory context; memory is tool-call only"
+    return None

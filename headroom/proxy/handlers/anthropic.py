@@ -2035,6 +2035,39 @@ class AnthropicHandlerMixin:
                     original_client_messages,
                     frozen_message_count,
                 )
+            # Cold-write coalescing (HEADROOM_COLD_COALESCE, opt-in). The provider
+            # caches a prefix only once the request that writes it has begun its
+            # response, so parallel requests on one lineage that are all cold pay
+            # the full write each. Let the first lead and hold the rest until its
+            # first byte, bounded by HEADROOM_COLD_COALESCE_MAX_WAIT_S.
+            _cold_coalesce_leader = False
+            if os.environ.get("HEADROOM_COLD_COALESCE", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            ) and hasattr(prefix_tracker, "expects_cold_write"):
+                try:
+                    _cc_max_wait = float(
+                        os.environ.get("HEADROOM_COLD_COALESCE_MAX_WAIT_S", "15") or 15
+                    )
+                except ValueError:
+                    _cc_max_wait = 15.0
+                if prefix_tracker.expects_cold_write(_cc_ttl):
+                    if prefix_tracker.begin_cold_send(_cc_max_wait):
+                        _cold_coalesce_leader = True
+                    else:
+                        async with stage_timer.measure("cold_coalesce_wait"):
+                            _cc_waited = await prefix_tracker.wait_for_warm(_cc_max_wait)
+                        logger.info(
+                            "[%s] cold-write coalesce: waited %.2fs for the leading request's "
+                            "first byte (max %.0fs)",
+                            request_id,
+                            _cc_waited,
+                            _cc_max_wait,
+                        )
+                        if hasattr(self.metrics, "record_cold_coalesce_wait"):
+                            await self.metrics.record_cold_coalesce_wait(_cc_waited)
+
             # Cold-prefix cache-miss hook (HEADROOM_COLD_RECOMPACT). Claude's thinking is
             # an encrypted handle we can't shrink, so when the prompt cache has lapsed
             # (idle past TTL → dead, nothing to bust) we instead recompact the whole
@@ -2536,6 +2569,10 @@ class AnthropicHandlerMixin:
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                                 )
 
+                            # Scope tags let /stats say what was eligible for
+                            # compression instead of guessing from an empty
+                            # transforms list (see cost.py uncompressed_reasons).
+                            tags["compression_scope"] = "full"
                             if result.messages != messages:
                                 optimized_messages = result.messages
                                 transforms_applied = list(result.transforms_applied) + [
@@ -2552,6 +2589,7 @@ class AnthropicHandlerMixin:
                             )
                         if delta is not None:
                             stable_forwarded_prefix, delta_messages = delta
+                            tags["compression_scope"] = "delta" if delta_messages else "frozen"
                             if delta_messages:
                                 # Compress the delta, with two cache-mode adjustments:
                                 #
@@ -3639,6 +3677,28 @@ class AnthropicHandlerMixin:
                     if _ts_client_defers
                     else ("headroom" if _ts_after is not _ts_before else "none")
                 )
+                _ts_client_tokens = 0
+                if _ts_client_defers:
+                    from headroom.proxy.helpers import iter_tool_entries
+
+                    try:
+                        _ts_client_tokens = tokenizer.count_text(
+                            json.dumps(
+                                [
+                                    t
+                                    for t in iter_tool_entries(_ts_before)
+                                    if t.get("defer_loading") is True
+                                ],
+                                default=str,
+                            )
+                        )
+                    except Exception:
+                        _ts_client_tokens = 0
+                # hasattr: stub metrics in tests implement only the request API.
+                if hasattr(self.metrics, "record_tool_search_mode"):
+                    await self.metrics.record_tool_search_mode(
+                        tags["tool_search_mode"], _ts_client_tokens
+                    )
                 if _ts_after is not _ts_before:
                     _ts_deferred = [
                         t for t in _ts_after if isinstance(t, dict) and t.get("defer_loading")
@@ -4097,6 +4157,8 @@ class AnthropicHandlerMixin:
                     else:
                         async with stage_timer.measure("upstream_connect"):
                             backend_response = await request_backend.send_message(body, headers)
+                        if hasattr(prefix_tracker, "mark_response_started"):
+                            prefix_tracker.mark_response_started()
                         self.pipeline_extensions.emit(
                             PipelineStage.POST_SEND,
                             operation="proxy.request",
@@ -4232,11 +4294,7 @@ class AnthropicHandlerMixin:
                             )
                             if miss.is_miss:
                                 logger.info(
-                                    f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
-                                    f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
-                                    f"expected_cached={miss.expected_cached_tokens:,} "
-                                    f"prefix_changed={miss.prefix_changed} "
-                                    f"ttl_exceeded={miss.ttl_exceeded}"
+                                    f"[{request_id}] CACHE-MISS-ATTRIBUTION: {miss.describe()}"
                                 )
                                 await self.metrics.record_cache_miss_attribution(
                                     provider_name, miss.reason
@@ -5385,11 +5443,7 @@ class AnthropicHandlerMixin:
                             )
                             if miss.is_miss:
                                 logger.info(
-                                    f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
-                                    f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
-                                    f"expected_cached={miss.expected_cached_tokens:,} "
-                                    f"prefix_changed={miss.prefix_changed} "
-                                    f"ttl_exceeded={miss.ttl_exceeded}"
+                                    f"[{request_id}] CACHE-MISS-ATTRIBUTION: {miss.describe()}"
                                 )
                                 await self.metrics.record_cache_miss_attribution(
                                     provider_name, miss.reason

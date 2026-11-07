@@ -16,6 +16,7 @@ pipeline skips them entirely.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import copy
 import hashlib
@@ -160,6 +161,81 @@ class CacheMissAttribution:
     cache_read_tokens: int = 0
     prefix_changed: bool = False
     ttl_exceeded: bool = False
+    # Where this turn's forwarded history first departs from the prefix cached
+    # last turn. Set only when ``prefix_changed`` is True, so the operator can
+    # tell a rewritten frozen message from a shorter history or a client that
+    # re-encoded an old block, without logging message content.
+    previous_prefix_messages: int = 0
+    divergence_index: int | None = None
+    divergence_role: str | None = None
+    divergence_detail: str | None = None
+
+    def describe(self) -> str:
+        """One-line form for the CACHE-MISS-ATTRIBUTION log record."""
+        parts = [
+            f"reason={self.reason}",
+            f"idle={self.idle_seconds:.0f}s",
+            f"ttl={self.cache_ttl_seconds}s",
+            f"expected_cached={self.expected_cached_tokens:,}",
+            f"prefix_changed={self.prefix_changed}",
+            f"ttl_exceeded={self.ttl_exceeded}",
+        ]
+        if self.prefix_changed:
+            parts.append(f"prev_prefix={self.previous_prefix_messages}")
+            if self.divergence_index is not None:
+                parts.append(
+                    f"diverged_at={self.divergence_index}"
+                    f"/{self.divergence_role or '?'}"
+                    f":{self.divergence_detail or 'content'}"
+                )
+        return " ".join(parts)
+
+
+def _block_type(block: Any) -> str:
+    if isinstance(block, dict):
+        return str(block.get("type") or "?")
+    return type(block).__name__
+
+
+def _describe_block_divergence(prev_blocks: list[Any], cur_blocks: list[Any]) -> str:
+    """Name the first differing content block between two canonical messages."""
+    if len(prev_blocks) != len(cur_blocks):
+        return f"blocks:{len(prev_blocks)}->{len(cur_blocks)}"
+    for i, (prev_block, cur_block) in enumerate(zip(prev_blocks, cur_blocks, strict=False)):
+        if prev_block == cur_block:
+            continue
+        prev_type = _block_type(prev_block)
+        cur_type = _block_type(cur_block)
+        if prev_type != cur_type:
+            return f"block[{i}].type:{prev_type}->{cur_type}"
+        return f"block[{i}].{prev_type}"
+    return "content"
+
+
+def _locate_prefix_divergence(
+    prev_canon: list[Any], cur_canon: list[Any]
+) -> tuple[int | None, str | None, str | None]:
+    """Find where ``cur_canon`` stops matching ``prev_canon`` as a prefix.
+
+    Both lists are canonical forms from :func:`_canonicalize_for_prefix_compare`.
+    Returns ``(index, role, detail)``; ``index`` is ``None`` when the previous
+    prefix still leads the current history.
+    """
+    if len(cur_canon) < len(prev_canon):
+        return len(cur_canon), None, f"shorter:{len(prev_canon)}->{len(cur_canon)}"
+    for i, (prev_msg, cur_msg) in enumerate(zip(prev_canon, cur_canon, strict=False)):
+        if prev_msg == cur_msg:
+            continue
+        prev_role = prev_msg.get("role") if isinstance(prev_msg, dict) else None
+        cur_role = cur_msg.get("role") if isinstance(cur_msg, dict) else None
+        if prev_role != cur_role:
+            return i, prev_role, f"role:{prev_role}->{cur_role}"
+        prev_content = prev_msg.get("content") if isinstance(prev_msg, dict) else None
+        cur_content = cur_msg.get("content") if isinstance(cur_msg, dict) else None
+        if isinstance(prev_content, list) and isinstance(cur_content, list):
+            return i, prev_role, _describe_block_divergence(prev_content, cur_content)
+        return i, prev_role, "content"
+    return None, None, None
 
 
 def _strip_cache_control(obj: Any) -> Any:
@@ -1247,6 +1323,15 @@ class PrefixCacheTracker:
         # resumes the state of the turn it extends, so a fork's response never
         # becomes the main line's frozen prefix or replay source.
         self._turn_states: dict[int, tuple[Any, ...] | None] = {}
+        # Cold-write coalescing (HEADROOM_COLD_COALESCE). The provider's cache
+        # entry only exists once the first request that writes it has begun
+        # its response, so two requests on one lineage that both go cold at
+        # the same moment each pay the full write. The first such request
+        # takes the lead; later ones wait for its first byte, then send into
+        # a warm cache. ``_cold_lead_started`` is the lease clock, so a leader
+        # that never answers is superseded instead of stalling followers.
+        self._cold_lead_started: float | None = None
+        self._cold_warm_event: asyncio.Event | None = None
 
         # Session-scoped ReadMaturationManager (Mechanism B), created
         # lazily by the handler when read maturation is enabled. Rides
@@ -1314,6 +1399,7 @@ class PrefixCacheTracker:
         """
         self._last_activity = time.time()
         self._turn_number += 1
+        self.mark_response_started()
         self._last_original_messages = copy.deepcopy(original_messages or messages)
         self._last_forwarded_messages = copy.deepcopy(messages)
 
@@ -1356,6 +1442,83 @@ class PrefixCacheTracker:
             cache_read_tokens,
             cache_write_tokens,
         )
+
+    # ------------------------------------------------------------------
+    # Cold-write coalescing
+    # ------------------------------------------------------------------
+
+    def expects_cold_write(self, cache_ttl_seconds: int | None = None) -> bool:
+        """True when this request will most likely write the prefix, not read it.
+
+        Either no provider cache was ever confirmed for this lineage (first
+        turn, or the last turn busted it), or the lineage has been idle past
+        the provider TTL. Reads the turn this request resumed, so a sibling's
+        fresh response does not make a cold fork look warm.
+        """
+        if self._request_turn_state()[1] <= 0:
+            return True
+        ttl = (
+            cache_ttl_seconds
+            if cache_ttl_seconds is not None
+            else self.resolved_cache_ttl_seconds()
+        )
+        return float(self._idle_seconds_at_fetch or 0.0) > float(ttl)
+
+    def begin_cold_send(self, lease_seconds: float) -> bool:
+        """Claim the lead for a cold write; True when this request now leads.
+
+        False means another request on this lineage already leads and has
+        not yet produced its first byte, so the caller should
+        :meth:`wait_for_warm` before sending. A lead whose response has
+        started, or whose lease has run out, is replaced.
+        """
+        now = time.time()
+        event = self._cold_warm_event
+        if (
+            event is not None
+            and not event.is_set()
+            and self._cold_lead_started is not None
+            and now - self._cold_lead_started < lease_seconds
+        ):
+            return False
+        self._cold_warm_event = asyncio.Event()
+        self._cold_lead_started = now
+        return True
+
+    async def wait_for_warm(self, max_wait_seconds: float) -> float:
+        """Wait for the leading cold request's first byte; returns seconds waited.
+
+        Bounded by ``max_wait_seconds`` and by the leader's remaining lease,
+        so a leader that fails before answering costs followers at most that
+        long, after which they send as they would have anyway.
+        """
+        event = self._cold_warm_event
+        if event is None or event.is_set():
+            return 0.0
+        started = time.time()
+        remaining = max_wait_seconds
+        if self._cold_lead_started is not None:
+            remaining = min(
+                remaining, max(0.0, self._cold_lead_started + max_wait_seconds - started)
+            )
+        if remaining <= 0:
+            return 0.0
+        try:
+            await asyncio.wait_for(event.wait(), remaining)
+        except asyncio.TimeoutError:
+            pass
+        return time.time() - started
+
+    def mark_response_started(self) -> None:
+        """The leading cold request has its first byte: the prefix is now cached."""
+        event = self._cold_warm_event
+        if event is not None and not event.is_set():
+            event.set()
+
+    def cold_followers_waiting(self) -> bool:
+        """True while a cold lead is in flight and has not yet answered."""
+        event = self._cold_warm_event
+        return event is not None and not event.is_set()
 
     def get_last_original_messages(self) -> list[dict[str, Any]]:
         return copy.deepcopy(self._request_turn_state()[3])
@@ -1531,7 +1694,10 @@ class PrefixCacheTracker:
 
         # Full miss on a prefix we expected cached. Attribute it.
         ttl_exceeded = idle_seconds > ttl
-        prefix_changed = not self._forwarded_prefix_stable(current_forwarded_messages)
+        prev_prefix_len, div_index, div_role, div_detail = self._prefix_divergence(
+            current_forwarded_messages
+        )
+        prefix_changed = div_index is not None
 
         if ttl_exceeded:
             reason = MISS_TTL_EXPIRY  # TTL wins ties (see docstring)
@@ -1549,24 +1715,46 @@ class PrefixCacheTracker:
             cache_read_tokens=cache_read_tokens,
             prefix_changed=prefix_changed,
             ttl_exceeded=ttl_exceeded,
+            previous_prefix_messages=prev_prefix_len,
+            divergence_index=div_index,
+            divergence_role=div_role,
+            divergence_detail=div_detail,
         )
 
     def _forwarded_prefix_stable(self, current_forwarded_messages: list[dict[str, Any]]) -> bool:
-        """True if last turn's forwarded prefix is still an exact prefix of this turn's.
+        """True if last turn's forwarded prefix still leads this turn's history.
 
-        The cached prefix is whatever we forwarded last turn. If those exact
+        The cached prefix is whatever we forwarded last turn. If those
         messages still lead the current forwarded list, the bytes the provider
         hashed for its cache key are unchanged, so a miss can't be blamed on
         content. Anything else (a frozen message rewritten, the prefix
         reordered, the list now shorter) counts as a prefix change.
         """
+        return self._prefix_divergence(current_forwarded_messages)[1] is None
+
+    def _prefix_divergence(
+        self, current_forwarded_messages: list[dict[str, Any]]
+    ) -> tuple[int, int | None, str | None, str | None]:
+        """Compare this turn's forwarded history with last turn's cached prefix.
+
+        The compare runs on :func:`_canonicalize_for_prefix_compare` forms, the
+        same equivalence the cache-stable delta path uses. Clients move their
+        ``cache_control`` breakpoints to the newest block every turn, and the
+        provider keys its cache on content, not on where the marker sits; a
+        raw-dict compare read every moved marker as a rewritten prefix and
+        attributed misses to ``prefix_change`` that were nothing of the kind.
+
+        Returns ``(previous_prefix_messages, index, role, detail)`` where
+        ``index`` is ``None`` when the previous prefix is intact.
+        """
         prev: list[dict[str, Any]] = self._request_turn_state()[4]
         if not prev:
             # No recorded prefix to compare — can't claim it changed.
-            return True
-        if len(current_forwarded_messages) < len(prev):
-            return False
-        return current_forwarded_messages[: len(prev)] == prev
+            return 0, None, None, None
+        prev_canon = _canonicalize_for_prefix_compare(prev)
+        cur_canon = _canonicalize_for_prefix_compare(current_forwarded_messages[: len(prev)])
+        index, role, detail = _locate_prefix_divergence(prev_canon, cur_canon)
+        return len(prev), index, role, detail
 
     def record_bust_avoided(self, tokens_preserved: int, compression_foregone: int) -> None:
         """Record when we chose to preserve cache over compressing."""

@@ -1,6 +1,8 @@
 """Tests for PrefixCacheTracker — cache-aware compression."""
 
+import asyncio
 import contextvars
+import copy
 import time
 
 import pytest
@@ -1356,6 +1358,101 @@ class TestClassifyCacheMiss:
         assert result.prefix_changed is True
         assert result.ttl_exceeded is False
 
+    def test_moved_cache_control_marker_is_not_a_prefix_change(self):
+        """A breakpoint moved to the newest block leaves the cached prefix intact.
+
+        Clients (Claude Code) move ``cache_control`` every turn; the provider
+        keys its cache on content, so a miss on an otherwise stable prefix is
+        ``unknown``, not ``prefix_change``.
+        """
+        tracker = PrefixCacheTracker("anthropic")
+        marked = [
+            {"role": "system", "content": "x" * 4000},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
+                ],
+            },
+        ]
+        self._warm(tracker, marked)
+        unmarked = [
+            {"role": "system", "content": "x" * 4000},
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}
+                ],
+            },
+        ]
+        result = tracker.classify_cache_miss(0, unmarked, idle_seconds=10)
+        assert result.prefix_changed is False
+        assert result.reason == MISS_UNKNOWN
+        assert result.divergence_index is None
+
+    def test_string_content_sugar_is_not_a_prefix_change(self):
+        """``"hello"`` and ``[{"type": "text", "text": "hello"}]`` are the same prefix."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        as_blocks = [
+            {"role": "system", "content": [{"type": "text", "text": "x" * 4000}]},
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+        ]
+        result = tracker.classify_cache_miss(0, as_blocks, idle_seconds=10)
+        assert result.prefix_changed is False
+        assert result.reason == MISS_UNKNOWN
+
+    def test_prefix_change_reports_where_the_history_diverged(self):
+        """A rewritten frozen block is located by message index, role and block."""
+        tracker = PrefixCacheTracker("anthropic")
+        history = [
+            {"role": "system", "content": "x" * 4000},
+            {"role": "user", "content": [{"type": "text", "text": "read it"}]},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"p": "a"}}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "the whole file"},
+                    {"type": "text", "text": "thanks"},
+                ],
+            },
+        ]
+        self._warm(tracker, history)
+        rewritten = copy.deepcopy(history)
+        rewritten[3]["content"][0]["content"] = "[file contents elided]"
+        rewritten.append({"role": "assistant", "content": [{"type": "text", "text": "ok"}]})
+        result = tracker.classify_cache_miss(0, rewritten, idle_seconds=10)
+        assert result.reason == MISS_PREFIX_CHANGE
+        assert result.previous_prefix_messages == 4
+        assert result.divergence_index == 3
+        assert result.divergence_role == "user"
+        assert result.divergence_detail == "block[0].tool_result"
+        assert "diverged_at=3/user:block[0].tool_result" in result.describe()
+        assert "prev_prefix=4" in result.describe()
+
+    def test_prefix_change_reports_shorter_history(self):
+        """A history that lost messages names the cut point, not a content diff."""
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE + [{"role": "assistant", "content": "hi"}])
+        result = tracker.classify_cache_miss(0, self.BASE, idle_seconds=10)
+        assert result.reason == MISS_PREFIX_CHANGE
+        assert result.divergence_index == 2
+        assert result.divergence_detail == "shorter:3->2"
+
+    def test_describe_omits_divergence_on_hits_and_ttl(self):
+        tracker = PrefixCacheTracker("anthropic")
+        self._warm(tracker, self.BASE)
+        hit = tracker.classify_cache_miss(800, self.BASE)
+        assert "diverged_at" not in hit.describe()
+        assert "prev_prefix" not in hit.describe()
+        expired = tracker.classify_cache_miss(0, self.BASE, idle_seconds=400)
+        assert expired.describe().startswith("reason=ttl_expiry idle=400s ttl=300s")
+
     def test_unknown_when_stable_prefix_within_ttl(self):
         """Within TTL, prefix unchanged, but still no read → unknown."""
         tracker = PrefixCacheTracker("anthropic")
@@ -1392,3 +1489,92 @@ class TestClassifyCacheMiss:
             ).resolved_cache_ttl_seconds()
             == 3600
         )
+
+
+class TestColdWriteCoalescing:
+    """HEADROOM_COLD_COALESCE: one cold write per lineage, followers wait for it."""
+
+    MSGS = [{"role": "user", "content": "hello"}]
+
+    def test_fresh_lineage_expects_cold_write(self):
+        tracker = PrefixCacheTracker("anthropic")
+        assert tracker.expects_cold_write(300) is True
+
+    def test_confirmed_cache_within_ttl_is_warm(self):
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.update_from_response(
+            cache_read_tokens=500, cache_write_tokens=500, messages=self.MSGS
+        )
+        tracker._idle_seconds_at_fetch = 10.0
+        assert tracker.expects_cold_write(300) is False
+
+    def test_idle_past_ttl_expects_cold_write(self):
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.update_from_response(
+            cache_read_tokens=500, cache_write_tokens=500, messages=self.MSGS
+        )
+        tracker._idle_seconds_at_fetch = 400.0
+        assert tracker.expects_cold_write(300) is True
+        tracker._idle_seconds_at_fetch = 400.0
+        assert tracker.expects_cold_write(3600) is False
+
+    def test_first_request_leads_and_second_follows(self):
+        tracker = PrefixCacheTracker("anthropic")
+        assert tracker.begin_cold_send(15) is True
+        assert tracker.begin_cold_send(15) is False
+        assert tracker.cold_followers_waiting() is True
+
+    def test_follower_is_released_by_first_byte(self):
+        async def run() -> float:
+            tracker = PrefixCacheTracker("anthropic")
+            assert tracker.begin_cold_send(15) is True
+            assert tracker.begin_cold_send(15) is False
+
+            async def leader_answers() -> None:
+                await asyncio.sleep(0.05)
+                tracker.mark_response_started()
+
+            asyncio.get_running_loop().create_task(leader_answers())
+            waited = await tracker.wait_for_warm(5.0)
+            assert tracker.cold_followers_waiting() is False
+            return waited
+
+        waited = asyncio.run(run())
+        assert 0.04 <= waited < 1.0
+
+    def test_wait_is_bounded_when_leader_never_answers(self):
+        async def run() -> float:
+            tracker = PrefixCacheTracker("anthropic")
+            tracker.begin_cold_send(0.1)
+            return await tracker.wait_for_warm(0.1)
+
+        waited = asyncio.run(run())
+        assert 0.09 <= waited < 1.0
+
+    def test_stale_lead_is_superseded(self):
+        tracker = PrefixCacheTracker("anthropic")
+        assert tracker.begin_cold_send(0.01) is True
+        time.sleep(0.02)
+        assert tracker.begin_cold_send(0.01) is True
+
+    def test_no_wait_when_nobody_leads_or_leader_answered(self):
+        async def run() -> tuple[float, float]:
+            tracker = PrefixCacheTracker("anthropic")
+            none = await tracker.wait_for_warm(1.0)
+            tracker.begin_cold_send(15)
+            tracker.mark_response_started()
+            answered = await tracker.wait_for_warm(1.0)
+            return none, answered
+
+        assert asyncio.run(run()) == (0.0, 0.0)
+
+    def test_response_update_ends_the_lead(self):
+        tracker = PrefixCacheTracker("anthropic")
+        tracker.begin_cold_send(15)
+        tracker.update_from_response(
+            cache_read_tokens=0, cache_write_tokens=900, messages=self.MSGS
+        )
+        assert tracker.cold_followers_waiting() is False
+        # The write is confirmed, so the next request on this lineage is warm.
+        tracker._idle_seconds_at_fetch = 1.0
+        assert tracker.expects_cold_write(300) is False

@@ -182,6 +182,20 @@ class PrometheusMetrics:
         # compression only — tool bytes never move tok_before/after) so every sink
         # can surface the tool-schema layer instead of silently dropping it.
         self.tool_search_saved_total = 0
+        # Who deferred tool schemas on each request: "headroom" (we injected
+        # defer_loading), "client" (the request already carried its own
+        # deferral, so we stood down and booked nothing) or "none". Without
+        # this a client that defers for itself reads in /stats exactly like
+        # the feature being off: tool_search_saved_total stays 0.
+        self.tool_search_mode_counts: dict[str, int] = defaultdict(int)
+        # Cold-write coalescing (HEADROOM_COLD_COALESCE): requests that waited
+        # for a leading cold request's first byte, and how long in total.
+        self.cold_coalesce_waits_total = 0
+        self.cold_coalesce_wait_seconds_total = 0.0
+        # Our tokenizer's size of the schemas the CLIENT deferred. Not a
+        # Headroom saving, never added to any savings total; it shows the
+        # operator the deferral is happening and roughly how much it covers.
+        self.tool_search_client_deferred_tokens_total = 0
         # Sum of tokens we actually attempted to compress across the
         # session: extracted units that passed all gates + tool-schema
         # tokens we ran compaction against. Excludes prefix-frozen
@@ -445,6 +459,10 @@ class PrometheusMetrics:
             self.tokens_saved_total = 0
             self.tool_search_saved_total = 0
             self.attempted_input_tokens_total = 0
+            self.tool_search_mode_counts.clear()
+            self.cold_coalesce_waits_total = 0
+            self.cold_coalesce_wait_seconds_total = 0.0
+            self.tool_search_client_deferred_tokens_total = 0
 
             self.compressions_by_strategy.clear()
             self.tokens_saved_by_strategy.clear()
@@ -1316,6 +1334,24 @@ class PrometheusMetrics:
         if not net_negative:
             self._net_tokens_negative = False
         return None
+
+    async def record_cold_coalesce_wait(self, seconds: float) -> None:
+        """Record one request that waited for a leading cold write to start."""
+        async with self._lock:
+            self.cold_coalesce_waits_total += 1
+            self.cold_coalesce_wait_seconds_total += max(0.0, float(seconds))
+
+    async def record_tool_search_mode(self, mode: str, client_deferred_tokens: int = 0) -> None:
+        """Record who deferred tool schemas on a request.
+
+        ``mode`` is the handler's ``tool_search_mode`` tag: ``headroom``,
+        ``client`` or ``none``. ``client_deferred_tokens`` is our count of the
+        schemas the client marked ``defer_loading``; it is reported beside the
+        savings, never added to them.
+        """
+        async with self._lock:
+            self.tool_search_mode_counts[mode] += 1
+            self.tool_search_client_deferred_tokens_total += max(0, int(client_deferred_tokens))
 
     async def record_cache_miss_attribution(self, provider: str, reason: str) -> None:
         """Record why a turn that expected a prompt-cache hit missed instead.

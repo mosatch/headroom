@@ -57,3 +57,21 @@ def test_stats_reports_configured_mode_for_compression_cache() -> None:
         assert response.status_code == 200
         data = response.json()
         assert data["compression_cache"]["mode"] == "cache"
+
+
+def test_memory_context_inert_in_cache_mode_auto_tail() -> None:
+    from headroom.proxy.modes import memory_context_inert_reason
+
+    reason = memory_context_inert_reason("cache", inject_context=True, memory_mode="auto_tail")
+    assert reason is not None
+    assert "cache mode" in reason
+    # Tool mode asks for tool-call-only memory, so it is not inert.
+    assert memory_context_inert_reason("cache", inject_context=True, memory_mode="tool") is None
+    # Nothing to inject, nothing inert.
+    assert (
+        memory_context_inert_reason("cache", inject_context=False, memory_mode="auto_tail") is None
+    )
+    # Token mode appends context on the live tail.
+    assert (
+        memory_context_inert_reason("token", inject_context=True, memory_mode="auto_tail") is None
+    )

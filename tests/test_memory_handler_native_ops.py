@@ -907,6 +907,8 @@ async def test_execute_search_update_delete_and_handler_status(
         "initialized": False,
         "native_tool": True,
         "bridge_enabled": False,
+        "inject_context": True,
+        "mode": "auto_tail",
     }
 
     seen = {"count": 0}

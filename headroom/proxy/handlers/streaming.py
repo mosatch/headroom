@@ -1048,12 +1048,7 @@ class StreamingMixin:
                     current_forwarded_messages=forwarded_messages,
                 )
                 if miss.is_miss:
-                    logger.info(
-                        f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
-                        f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
-                        f"expected_cached={miss.expected_cached_tokens:,} "
-                        f"prefix_changed={miss.prefix_changed} ttl_exceeded={miss.ttl_exceeded}"
-                    )
+                    logger.info(f"[{request_id}] CACHE-MISS-ATTRIBUTION: {miss.describe()}")
                     await self.metrics.record_cache_miss_attribution(provider, miss.reason)
 
             tracker_cache_write = cache_write_tokens
@@ -1801,6 +1796,10 @@ class StreamingMixin:
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
                             stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
+                            # First byte: the provider has the prefix cached now, so
+                            # requests held by cold-write coalescing can send.
+                            if hasattr(prefix_tracker, "mark_response_started"):
+                                prefix_tracker.mark_response_started()
 
                         stream_state["total_bytes"] += len(chunk)
 
@@ -2262,6 +2261,10 @@ class StreamingMixin:
                     # Record TTFB on first event
                     if stream_state["ttfb_ms"] is None:
                         stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
+                        # First byte: the provider has the prefix cached now, so
+                        # requests held by cold-write coalescing can send.
+                        if hasattr(prefix_tracker, "mark_response_started"):
+                            prefix_tracker.mark_response_started()
 
                     # Backfill input_tokens on message_start (issue #1132).
                     # LiteLLM/Bedrock streaming never surfaces prompt tokens
@@ -2401,13 +2404,7 @@ class StreamingMixin:
                             current_forwarded_messages=tracker_messages,
                         )
                         if miss.is_miss:
-                            logger.info(
-                                f"[{request_id}] CACHE-MISS-ATTRIBUTION: reason={miss.reason} "
-                                f"idle={miss.idle_seconds:.0f}s ttl={miss.cache_ttl_seconds}s "
-                                f"expected_cached={miss.expected_cached_tokens:,} "
-                                f"prefix_changed={miss.prefix_changed} "
-                                f"ttl_exceeded={miss.ttl_exceeded}"
-                            )
+                            logger.info(f"[{request_id}] CACHE-MISS-ATTRIBUTION: {miss.describe()}")
                             await self.metrics.record_cache_miss_attribution(provider, miss.reason)
                     prefix_tracker.update_from_response(
                         cache_read_tokens=cache_read_tokens,

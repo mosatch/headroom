@@ -324,3 +324,124 @@ def test_read_maturation_reports_whether_it_can_fire(
     assert (payload["inert_reason"] is None) is effective
     banner = [r for r in caplog.records if r.getMessage().startswith("Read maturation:")]
     assert [r.levelname for r in banner] == [startup_level]
+
+
+def _stats_app(mode: str):
+    return create_app(
+        ProxyConfig(
+            mode=mode,
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            http2=False,
+        )
+    )
+
+
+def _unsaved(request_id: str, **extra: object) -> FakeLogEntry:
+    entry: dict[str, object] = {
+        "request_id": request_id,
+        "timestamp": "2026-11-07T10:00:00Z",
+        "provider": "anthropic",
+        "model": "claude-opus",
+        "input_tokens_original": 50_000,
+        "input_tokens_optimized": 50_000,
+        "output_tokens": 10,
+        "tokens_saved": 0,
+        "savings_percent": 0.0,
+        "transforms_applied": [],
+        "tags": {},
+    }
+    entry.update(extra)
+    return FakeLogEntry(entry)
+
+
+def test_uncompressed_reasons_follow_handler_scope_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cache mode: an empty transforms list is not evidence of a frozen history.
+
+    The handler tags what the pipeline could touch. A skipped turn is a
+    passthrough with its reason kept, a turn whose new tail had nothing to
+    fold is ``no_compressible_content``, and only a turn with no un-frozen
+    tail at all is ``prefix_frozen``. Untagged legacy entries keep the old
+    heuristic.
+    """
+    monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
+    app = _stats_app("cache")
+    logger = FakeRequestLogger()
+    app.state.proxy.logger = logger
+    logger.logs = [
+        _unsaved("skip", tags={"passthrough_reason": "cache_mode_prefix_mismatch"}),
+        _unsaved("delta-empty", tags={"compression_scope": "delta"}),
+        _unsaved(
+            "delta-noop",
+            tags={"compression_scope": "delta"},
+            transforms_applied=["anthropic:tool_schema_compaction"],
+        ),
+        _unsaved("full-small", tags={"compression_scope": "full"}, input_tokens_original=120),
+        _unsaved("frozen", tags={"compression_scope": "frozen"}),
+        _unsaved("legacy"),
+    ]
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        summary = client.get("/stats").json()["summary"]
+
+    assert summary["uncompressed_requests"] == {
+        "passthrough": 1,
+        "no_compressible_content": 2,
+        "too_small": 1,
+        "prefix_frozen": 2,
+    }
+    assert summary["passthrough_reasons"] == {"cache_mode_prefix_mismatch": 1}
+    # Two genuinely frozen turns do not earn the "switch to token mode" tip.
+    assert "tip" not in summary
+
+
+def test_token_mode_tip_needs_frozen_turns_not_empty_deltas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
+    app = _stats_app("cache")
+    logger = FakeRequestLogger()
+    app.state.proxy.logger = logger
+    logger.logs = [_unsaved(f"delta-{i}", tags={"compression_scope": "delta"}) for i in range(12)]
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        summary = client.get("/stats").json()["summary"]
+    assert summary["uncompressed_requests"] == {"no_compressible_content": 12}
+    assert "tip" not in summary
+
+    logger.logs = [_unsaved(f"frozen-{i}", tags={"compression_scope": "frozen"}) for i in range(12)]
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        summary = client.get("/stats").json()["summary"]
+    assert summary["uncompressed_requests"] == {"prefix_frozen": 12}
+    assert "HEADROOM_MODE=token" in summary["tip"]
+
+
+def test_stats_report_who_deferred_tool_schemas(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A client that defers its own tools must not read as deferral being off.
+
+    ``tool_schema_tokens_saved`` stays 0 by design when the client already
+    sent ``defer_loading``; the summary now says so beside it.
+    """
+    import asyncio
+
+    monkeypatch.setenv("HEADROOM_REQUIRE_RUST_CORE", "false")
+    app = _stats_app("cache")
+    metrics = app.state.proxy.metrics
+    asyncio.run(metrics.record_tool_search_mode("client", 7_000))
+    asyncio.run(metrics.record_tool_search_mode("client", 7_400))
+    asyncio.run(metrics.record_tool_search_mode("headroom", 0))
+    asyncio.run(metrics.record_tool_search_mode("none"))
+
+    with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 12345)) as client:
+        compression = client.get("/stats").json()["summary"]["compression"]
+
+    assert compression["tool_schema_tokens_saved"] == 0
+    assert compression["tool_search_modes"] == {"client": 2, "headroom": 1, "none": 1}
+    assert compression["tool_schema_tokens_deferred_by_client"] == 14_400
+    # Reported beside the savings, never folded into them.
+    assert compression["total_tokens_saved_all_layers"] == 0

@@ -177,6 +177,7 @@ from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
     PROXY_MODE_TOKEN,
     is_token_mode,
+    memory_context_inert_reason,
     normalize_proxy_mode,
     read_maturation_inert_reason,
 )
@@ -2386,6 +2387,30 @@ class HeadroomProxy(
                 "Memory: ENABLED "
                 f"(backend={memory_status['backend']}, initialized={memory_status['initialized']})"
             )
+            _mem_inert = memory_context_inert_reason(
+                self.config.mode,
+                inject_context=self.memory_handler.config.inject_context,
+                memory_mode=getattr(self.memory_handler.config.mode, "value", None),
+            )
+            if _mem_inert:
+                _mem_tool_bytes = 0
+                if self.memory_handler.config.inject_tools:
+                    try:
+                        _mem_tool_bytes = len(
+                            json.dumps(
+                                self.memory_handler.compute_memory_tool_definitions("anthropic"),
+                                separators=(",", ":"),
+                            )
+                        )
+                    except Exception:  # pragma: no cover - diagnostic only
+                        _mem_tool_bytes = 0
+                logger.warning(
+                    "Memory: context injection INERT (%s); the %d bytes of memory tool "
+                    "schema still ride on every request. Use --mode token, "
+                    "HEADROOM_MEMORY_INJECTION_MODE=tool, or drop --memory",
+                    _mem_inert,
+                    _mem_tool_bytes,
+                )
         else:
             logger.info("Memory: DISABLED")
 
@@ -3894,6 +3919,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 initialized=memory_initialized,
                 native_tool=bool(memory_status.get("native_tool", False)),
                 bridge_enabled=bool(memory_status.get("bridge_enabled", False)),
+                # None when context injection can happen; otherwise why it
+                # never will under this proxy mode (tool calls still work).
+                context_injection_inert_reason=(
+                    memory_context_inert_reason(
+                        config.mode,
+                        inject_context=bool(memory_status.get("inject_context", False)),
+                        memory_mode=memory_status.get("mode"),
+                    )
+                    if memory_enabled
+                    else None
+                ),
             ),
             "upstream": _component_health(
                 enabled=os.environ.get("HEADROOM_SKIP_UPSTREAM_CHECK", "").strip() != "1",
