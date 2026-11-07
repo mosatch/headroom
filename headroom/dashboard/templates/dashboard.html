@@ -1679,6 +1679,123 @@
                         </div>
                     </template>
                 </section>
+                <!-- Attribution report (the opt-in "attribution" proxy extension; hidden when it is off) -->
+                <section class="bg-surface rounded-lg border border-border overflow-hidden mt-6"
+                         data-testid="attribution-report"
+                         x-show="attributionReport"
+                         x-data="{ dim: '' }"
+                         x-effect="const cbd = attributionReport?.cache_by_dimension || {}; if (!dim || !cbd[dim]) { dim = cbd.host ? 'host' : (Object.keys(cbd)[0] || '') }">
+                    <div class="px-4 py-3 border-b border-border flex justify-between items-center gap-3 flex-wrap">
+                        <div>
+                            <span class="text-sm font-medium text-gray-300">Attribution Report</span>
+                            <div class="text-xs text-gray-500 mt-0.5">
+                                Cache economics and the costliest conversations since the proxy started
+                                (<span x-text="formatNumber(attributionReport?.totals?.requests || 0)"></span> requests,
+                                from <span class="font-mono">/attribution/report</span>)
+                            </div>
+                        </div>
+                        <div class="flex gap-1 flex-wrap">
+                            <template x-for="name in Object.keys(attributionReport?.cache_by_dimension || {})" :key="name">
+                                <button type="button" class="px-2 py-0.5 text-xs font-mono rounded border border-border"
+                                        :class="dim === name ? 'bg-accent/20 text-accent' : 'text-gray-400 hover:bg-border/40'"
+                                        :aria-pressed="dim === name"
+                                        @click="dim = name" x-text="name"></button>
+                            </template>
+                        </div>
+                    </div>
+                    <template x-if="(attributionReport?.insights || []).length">
+                        <ul class="px-4 py-3 border-b border-border text-sm text-gray-300 space-y-1 list-disc list-inside">
+                            <template x-for="line in attributionReport.insights" :key="line">
+                                <li x-text="line"></li>
+                            </template>
+                        </ul>
+                    </template>
+                    <template x-if="!dim">
+                        <div class="px-4 py-8 text-center text-xs text-gray-500">
+                            No requests since the proxy started.
+                        </div>
+                    </template>
+                    <template x-if="dim">
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-sm" style="table-layout:fixed">
+                                <thead class="text-xs text-gray-500 tracking-wide">
+                                    <tr>
+                                        <th class="px-4 py-3 font-medium text-left" x-text="dim"></th>
+                                        <th class="px-4 py-3 font-medium text-right">Requests</th>
+                                        <th class="px-4 py-3 font-medium text-right" title="Share of input tokens read from the prompt cache">Cache Read</th>
+                                        <th class="px-4 py-3 font-medium text-right" title="A conversation that was reading its cached prefix and re-wrote it instead">Busts</th>
+                                        <th class="px-4 py-3 font-medium text-right" title="Tokens re-written by those busts">Re-written</th>
+                                        <th class="px-4 py-3 font-medium text-right">Est. Cost</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-border">
+                                    <template x-for="[label, info] in Object.entries((attributionReport?.cache_by_dimension || {})[dim] || {})" :key="dim + ':' + label">
+                                        <tr class="hover:bg-border/30 transition-colors">
+                                            <td class="px-4 py-3 text-left truncate">
+                                                <span class="px-2 py-0.5 bg-border text-xs font-mono" x-text="label"></span>
+                                            </td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(info.requests || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums text-emerald-400" x-text="((info.cache_read_share || 0) * 100).toFixed(1) + '%'"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums"
+                                                :class="(info.busts || 0) > 0 ? 'text-red-400' : 'text-gray-500'"
+                                                x-text="formatNumber(info.busts || 0) + ' (' + ((info.bust_rate || 0) * 100).toFixed(1) + '%)'"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="formatNumber(info.bust_write_tokens || 0)"></td>
+                                            <td class="px-4 py-3 text-right font-mono tabular-nums" x-text="'$' + formatCurrency(info.cost_usd || 0)"></td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                    <template x-if="(attributionReport?.top_sessions || []).length">
+                        <div class="border-t border-border">
+                            <div class="px-4 pt-3 text-xs font-medium text-gray-400">
+                                Costliest conversations
+                                <span class="text-gray-500 font-normal"
+                                      x-text="'(' + formatNumber(attributionReport.sessions_tracked || 0) + ' tracked)'"></span>
+                            </div>
+                            <div class="overflow-x-auto">
+                                <table class="w-full text-sm">
+                                    <thead class="text-xs text-gray-500 tracking-wide">
+                                        <tr>
+                                            <th class="px-4 py-2 font-medium text-left">Conversation</th>
+                                            <th class="px-4 py-2 font-medium text-left">Labels</th>
+                                            <th class="px-4 py-2 font-medium text-right">Requests</th>
+                                            <th class="px-4 py-2 font-medium text-right">Busts</th>
+                                            <th class="px-4 py-2 font-medium text-right">Duration</th>
+                                            <th class="px-4 py-2 font-medium text-right">Est. Cost</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-border">
+                                        <template x-for="s in attributionReport.top_sessions" :key="s.conversation">
+                                            <tr class="hover:bg-border/30 transition-colors">
+                                                <td class="px-4 py-2 text-left font-mono text-xs text-gray-300"
+                                                    :title="s.conversation + ((s.models || []).length ? ' · ' + s.models.join(', ') : '')"
+                                                    x-text="String(s.conversation || '').slice(0, 8)"></td>
+                                                <td class="px-4 py-2 text-left">
+                                                    <div class="flex gap-1 flex-wrap">
+                                                        <template x-for="[k, v] in Object.entries(s.labels || {})" :key="k">
+                                                            <span class="px-1.5 py-0.5 bg-border text-xs font-mono" x-text="k + '=' + v"></span>
+                                                        </template>
+                                                    </div>
+                                                </td>
+                                                <td class="px-4 py-2 text-right font-mono tabular-nums" x-text="formatNumber(s.requests || 0)"></td>
+                                                <td class="px-4 py-2 text-right font-mono tabular-nums"
+                                                    :class="(s.busts || 0) > 0 ? 'text-red-400' : 'text-gray-500'"
+                                                    x-text="formatNumber(s.busts || 0)"></td>
+                                                <td class="px-4 py-2 text-right font-mono tabular-nums text-gray-400" x-text="formatSpan(s.duration_s || 0)"></td>
+                                                <td class="px-4 py-2 text-right font-mono tabular-nums" x-text="'$' + formatCurrency(s.cost_usd || 0)"></td>
+                                            </tr>
+                                        </template>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </template>
+                    <template x-if="(attributionReport?.notes || []).length">
+                        <div class="px-4 py-2 border-t border-border text-xs text-gray-500" x-text="attributionReport.notes.join(' ')"></div>
+                    </template>
+                </section>
             </div>
         </template>
 
@@ -2119,6 +2236,8 @@
                     try { localStorage.setItem('headroom-teams-contact-dismissed', '1'); } catch (e) {}
                 },
                 lifetimeStats: {},
+                // /attribution/report, or null when the extension is off.
+                attributionReport: null,
                 historyStats: {},
                 healthy: true,
                 version: 'loading',
@@ -2271,6 +2390,15 @@
                     } catch (e) {
                         console.error('Failed to fetch lifetime stats:', e);
                     }
+                    await this.fetchAttributionReport();
+                },
+                async fetchAttributionReport() {
+                    // Served by the opt-in attribution extension; a 404 just hides the card.
+                    try {
+                        this.attributionReport = await this.fetchJson('/attribution/report');
+                    } catch (e) {
+                        this.attributionReport = null;
+                    }
                 },
                 async fetchHistoryStats() {
                     try {
@@ -2410,6 +2538,12 @@
                     if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                     if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                     return n.toString();
+                },
+
+                formatSpan(seconds) {
+                    if (seconds >= 3600) return (seconds / 3600).toFixed(1) + 'h';
+                    if (seconds >= 60) return Math.round(seconds / 60) + 'm';
+                    return Math.round(seconds) + 's';
                 },
 
                 formatCO2(mg) {

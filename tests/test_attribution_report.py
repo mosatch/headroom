@@ -258,3 +258,21 @@ def test_install_serves_report_to_operators_only(tmp_path, monkeypatch):
         assert body["savings_by_dimension"]["host"]["mbmini"]["tokens_saved"] == 400
     with TestClient(app, base_url="http://10.0.0.5", client=("10.0.0.9", 1)) as remote:
         assert remote.get("/attribution/report").status_code in (401, 403, 404)
+
+
+def test_dashboard_card_reads_the_report_and_hides_without_it():
+    """The Lifetime view's Attribution Report card fetches the extension's
+    route and stays hidden when the extension is off (the fetch 404s)."""
+    from headroom.dashboard import get_dashboard_html
+
+    html = get_dashboard_html(licensed=True)
+    card = html[html.index('data-testid="attribution-report"') :]
+    card = card[: card.index("</section>")]
+    assert 'x-show="attributionReport"' in card
+    for field in ("cache_by_dimension", "top_sessions", "insights", "bust_rate", "cost_usd"):
+        assert field in card, field
+    loader = html[html.index("async fetchAttributionReport()") :]
+    loader = loader[: loader.index("},")]
+    assert "this.fetchJson('/attribution/report')" in loader
+    assert "this.attributionReport = null" in loader
+    assert "await this.fetchAttributionReport();" in html
