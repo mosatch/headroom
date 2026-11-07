@@ -371,6 +371,10 @@ class ProxyConfig:
     # wildcard. Empty/None means no extensions run, even if installed.
     # CLI: --proxy-extension <name1,name2>; env: HEADROOM_PROXY_EXTENSIONS.
     proxy_extensions: list[str] | None = None
+    # Attribution dimensions a request must carry a client-sent label for, or be
+    # refused (headroom.proxy.attribution_policy). None reads
+    # HEADROOM_REQUIRE_DIMENSIONS; empty means best-effort attribution.
+    require_dimensions: list[str] | None = None
 
     # Compressor selection (opt-in narrowing of the built-in compressor set).
     # None (the default) leaves EVERY built-in compressor enabled — byte-

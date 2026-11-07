@@ -514,7 +514,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if/when another contract surface emerges, but YAGNI.
     """
     from headroom.copilot_auth import consume_request_routed_to_copilot
-    from headroom.proxy.attribution import get_current_attribution, merge_attribution
+    from headroom.proxy.attribution import (
+        get_current_attribution,
+        get_current_conversation,
+        merge_attribution,
+    )
     from headroom.proxy.cost import _summarize_transforms
     from headroom.proxy.models import RequestLog
     from headroom.proxy.project_context import get_current_project
@@ -683,7 +687,9 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                     tokens_saved=outcome.tokens_saved,
                     novel_tokens_saved=novel_tokens_saved,
                     attribution=attribution,
-                    conversation_key=outcome.conversation_key,
+                    # The handler's key when it derived one; else the conversation
+                    # the client named (Claude Code's session id), for reporting.
+                    conversation_key=outcome.conversation_key or get_current_conversation(),
                     original_tokens=outcome.original_tokens,
                     output_tokens_saved=output_tokens_saved_est,
                 ),

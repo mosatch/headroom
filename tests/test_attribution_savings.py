@@ -103,6 +103,27 @@ def test_state_without_dimensions_loads_and_garbage_is_dropped(tmp_path):
     assert by_dim["host"]["ok"]["tokens_saved"] == 7
 
 
+def test_legacy_hosts_map_seeds_the_host_dimension(tmp_path):
+    path = tmp_path / "savings.json"
+    tracker = SavingsTracker(path=path)
+    tracker.record_request(model="gpt-4o", input_tokens=100, tokens_saved=10)
+    tracker.flush()
+    raw = json.loads(path.read_text())
+    raw["hosts"] = {"mbmini": {"requests": 12, "tokens_saved": 900, "total_input_tokens": 100}}
+    path.write_text(json.dumps(raw))
+
+    reloaded = SavingsTracker(path=path)
+    assert reloaded.snapshot()["by_dimension"]["host"]["mbmini"]["tokens_saved"] == 900
+    reloaded.record_request(
+        model="gpt-4o", input_tokens=10, tokens_saved=5, attribution={"host": "mbmini"}
+    )
+    reloaded.flush()
+    saved = json.loads(path.read_text())
+    assert saved["dimensions"]["host"]["mbmini"]["tokens_saved"] == 905
+    # Once carried over, the dimension wins over a stale legacy map.
+    assert SavingsTracker(path=path).snapshot()["by_dimension"]["host"]["mbmini"]["requests"] == 13
+
+
 # ── Ledger ────────────────────────────────────────────────────────────
 
 
@@ -327,3 +348,36 @@ def test_network_callers_do_not_see_labels(tmp_path, monkeypatch):
         lifetime = remote.get("/stats-lifetime")
         if lifetime.status_code == 200:
             assert "by_dimension" not in lifetime.json()
+
+
+def test_snapshot_falls_back_to_the_client_named_conversation(tmp_path, monkeypatch):
+    from headroom.pipeline import PipelineStage
+    from headroom.proxy.attribution import (
+        conversation_hint,
+        set_current_conversation,
+    )
+
+    assert conversation_hint({"x-claude-code-session-id": "abc-1"}) == "abc-1"
+    assert (
+        conversation_hint({"x-headroom-session-id": "mine", "x-claude-code-session-id": "x"})
+        == "mine"
+    )
+    assert conversation_hint({}) is None
+
+    seen = []
+
+    class Listener:
+        def on_pipeline_event(self, event):
+            if event.stage is PipelineStage.OUTCOME_OBSERVED:
+                seen.append(event.outcome)
+
+    with _proxy_client(tmp_path, monkeypatch) as client:
+        proxy = client.app.state.proxy
+        proxy.pipeline_extensions.add(Listener())
+        set_current_conversation("cc-session-7")
+        try:
+            _emit(proxy)  # handler derived no key: the client's wins
+            _emit(proxy, request_id="req-2", conversation_key="handler-key")
+        finally:
+            set_current_conversation(None)
+    assert [s.conversation_key for s in seen[-2:]] == ["cc-session-7", "handler-key"]

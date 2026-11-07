@@ -49,6 +49,23 @@ in `X-Headroom-Labels`. That last one is off by default: each dimension is persi
 state, so the operator opts in. At most 16 dimensions and 50 labels per dimension are
 kept; the smallest, oldest label is evicted first.
 
+## Requiring it
+
+On a shared gateway, a caller that sends no label leaves the per-label tables
+incomplete. Make a label a precondition for service:
+
+```bash
+headroom proxy --require-dimension host --require-dimension project
+# or HEADROOM_REQUIRE_DIMENSIONS=host,project
+```
+
+A model request without a **client-sent** label for each listed dimension is refused
+with a 400 (WebSocket: close 1008) naming the headers to send. Proxy-side fallbacks do
+not count: `host` needs `X-Headroom-Host` (the peer address would satisfy everyone),
+and `traffic_class` needs an identified client. A `/p/<name>` prefix satisfies
+`project`. Health, dashboard, stats, metrics and the attribution report are never
+refused.
+
 ## Seeing it
 
 ```bash
@@ -96,7 +113,9 @@ The bundled `attribution` proxy extension (`--proxy-extension attribution`) adds
   was reading its cached prefix and suddenly re-writes it, the expensive event). A
   label that busts far more often than the rest is usually one client, plugin or prompt
   template worth looking at.
-- **Most expensive conversations**, with their labels.
+- **Most expensive conversations**, with their labels. A conversation is the handler's
+  own key when it has one, else the client's session id (`X-Headroom-Session-Id`, or
+  Claude Code's `X-Claude-Code-Session-Id`).
 - **`repo` and `branch` dimensions** — from `X-Headroom-Repo` / `X-Headroom-Branch`, or,
   for a `headroom wrap` session on the proxy's machine, read from the workspace's git
   checkout, so `headroom savings --by branch` answers "what did this branch cost".

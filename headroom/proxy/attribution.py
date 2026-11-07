@@ -378,6 +378,36 @@ def get_current_attribution() -> Mapping[str, str]:
     return _current_attribution.get()
 
 
+#: Headers that name the client's own conversation, in priority order. Used only
+#: to group requests into conversations for reporting (``OutcomeSnapshot.
+#: conversation_key`` when the handler derived none), never for accounting.
+CONVERSATION_HEADERS: Final[tuple[str, ...]] = (
+    "x-headroom-session-id",
+    "x-claude-code-session-id",
+)
+
+_current_conversation: ContextVar[str | None] = ContextVar(
+    "headroom_current_conversation", default=None
+)
+
+
+def conversation_hint(headers: Mapping[str, str]) -> str | None:
+    """The client-named conversation for a request, from :data:`CONVERSATION_HEADERS`."""
+    for name in CONVERSATION_HEADERS:
+        label = sanitize_label(headers.get(name))
+        if label is not None:
+            return label
+    return None
+
+
+def set_current_conversation(value: str | None) -> None:
+    _current_conversation.set(sanitize_label(value))
+
+
+def get_current_conversation() -> str | None:
+    return _current_conversation.get()
+
+
 def bind_label(dimension: str, value: Any) -> None:
     """Add or replace one label on the current request.
 
@@ -479,7 +509,11 @@ __all__ = [
     "OTEL_ATTRIBUTION_ENV_VAR",
     "OPEN_LABELS_TOKEN",
     "Resolver",
+    "CONVERSATION_HEADERS",
     "bind_label",
+    "conversation_hint",
+    "get_current_conversation",
+    "set_current_conversation",
     "default_dimensions",
     "enabled_dimensions",
     "format_labels",

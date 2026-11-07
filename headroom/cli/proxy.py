@@ -582,6 +582,19 @@ def dashboard(port: int | None, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--require-dimension",
+    "require_dimension",
+    multiple=True,
+    envvar="HEADROOM_REQUIRE_DIMENSIONS",
+    help=(
+        "Refuse model requests that carry no client-sent label for this attribution "
+        "dimension (host, project, team, ...). For shared gateways, where unattributed "
+        "traffic leaves the per-label tables incomplete. Health, dashboard, stats and "
+        "metrics are never affected. Repeat or comma-separate. "
+        "Env: HEADROOM_REQUIRE_DIMENSIONS."
+    ),
+)
+@click.option(
     "--proxy-extension",
     "proxy_extension",
     multiple=True,
@@ -1226,6 +1239,7 @@ def proxy(
     no_ccr_proactive_expansion: bool,
     no_ccr_response_handling: bool,
     proxy_extension: tuple[str, ...],
+    require_dimension: tuple[str, ...],
     compressor: tuple[str, ...],
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
@@ -1572,6 +1586,15 @@ def proxy(
         # both yield ["a", "b", "c"]. None when nothing was supplied.
         proxy_extensions=(
             [part.strip() for chunk in proxy_extension for part in chunk.split(",") if part.strip()]
+            or None
+        ),
+        require_dimensions=(
+            [
+                part.strip()
+                for chunk in require_dimension
+                for part in chunk.split(",")
+                if part.strip()
+            ]
             or None
         ),
         # Same flatten-and-split shape as proxy_extensions, but a set: order

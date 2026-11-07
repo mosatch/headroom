@@ -120,8 +120,10 @@ from headroom.providers.registry import (
 from headroom.proxy import runtime_env
 from headroom.proxy.attribution import (
     AttributionRequest,
+    conversation_hint,
     resolve_attribution,
     set_current_attribution,
+    set_current_conversation,
 )
 from headroom.proxy.audit import is_auditable_path, record_admin_action
 from headroom.proxy.auth_mode import CLIENT_UA_MAP, should_stamp_codex_client
@@ -3264,36 +3266,52 @@ class WebSocketAuthMiddleware:
 
 
 def _bind_request_attribution(
-    scope: Any, headers: Mapping[str, str], path: str, path_project: str | None
-) -> None:
+    scope: Any,
+    headers: Mapping[str, str],
+    path: str,
+    path_project: str | None,
+    required: tuple[str, ...] = (),
+) -> tuple[str, ...]:
     """Resolve this request's attribution labels into the request context.
 
     Runs where project attribution is captured, for HTTP and WebSocket alike.
-    Never raises: a failure leaves the request unattributed, as before.
+    Returns the ``required`` dimensions the request lacks a client-sent label
+    for (empty when nothing is required). Never raises: a failure leaves the
+    request unattributed, as before, and is not held against it.
     """
     try:
         client = scope.get("client") if isinstance(scope, Mapping) else None
         peer = client[0] if client else None
-        set_current_attribution(
-            resolve_attribution(
-                AttributionRequest(
-                    headers={str(k).lower(): v for k, v in headers.items()},
-                    path=path,
-                    peer=peer,
-                    path_project=path_project,
-                )
-            )
+        lowered = {str(k).lower(): v for k, v in headers.items()}
+        set_current_conversation(conversation_hint(lowered))
+        attribution_request = AttributionRequest(
+            headers=lowered,
+            path=path,
+            peer=peer,
+            path_project=path_project,
         )
+        set_current_attribution(resolve_attribution(attribution_request))
+        if required:
+            from headroom.proxy.attribution_policy import missing_dimensions
+
+            return missing_dimensions(attribution_request, required)
     except Exception:  # noqa: BLE001 - attribution must never fail a request
         logger.debug("attribution resolve failed", exc_info=True)
         set_current_attribution(None)
+        set_current_conversation(None)
+    return ()
 
 
 class WebSocketProjectPrefixMiddleware:
-    """Normalize project-prefixed WebSocket paths before route matching."""
+    """Normalize project-prefixed WebSocket paths before route matching.
 
-    def __init__(self, app: Any) -> None:
+    Also binds attribution for the socket and, when dimensions are required,
+    refuses an unattributed upgrade with close code 1008 (policy violation).
+    """
+
+    def __init__(self, app: Any, required_dimensions: tuple[str, ...] = ()) -> None:
         self.app = app
+        self.required_dimensions = tuple(required_dimensions)
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope["type"] == "websocket":
@@ -3302,7 +3320,18 @@ class WebSocketProjectPrefixMiddleware:
                 name.decode("latin-1"): value.decode("latin-1") for name, value in scope["headers"]
             }
             set_current_project(classify_project(headers) or prefix_project)
-            _bind_request_attribution(scope, headers, scope.get("path", ""), prefix_project)
+            missing = _bind_request_attribution(
+                scope, headers, scope.get("path", ""), prefix_project, self.required_dimensions
+            )
+            if missing:
+                logger.info(
+                    "event=attribution_refused transport=ws path=%s missing=%s",
+                    scope.get("path", ""),
+                    ",".join(missing),
+                )
+                await receive()  # the websocket.connect event, before close
+                await send({"type": "websocket.close", "code": 1008})
+                return
         await self.app(scope, receive, send)
 
 
@@ -3693,7 +3722,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
-    app.add_middleware(WebSocketProjectPrefixMiddleware)
+    from headroom.proxy.attribution_policy import required_dimensions
+
+    _required_dimensions = required_dimensions(getattr(config, "require_dimensions", None))
+    if _required_dimensions:
+        logger.info("Attribution required for model traffic: %s", ", ".join(_required_dimensions))
+    app.add_middleware(WebSocketProjectPrefixMiddleware, required_dimensions=_required_dimensions)
     loop_health_state: LoopHealthState = {
         "status": "healthy",
         "known_failures": 0,
@@ -4231,11 +4265,28 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         if should_stamp_codex_client(path, headers):
             request.scope["headroom_codex_client_stamped"] = True
             request.scope["headers"].append((b"x-client", b"codex"))
-            _bind_request_attribution(
-                request.scope, {**headers, "x-client": "codex"}, path, prefix_project
+            missing_attribution = _bind_request_attribution(
+                request.scope,
+                {**headers, "x-client": "codex"},
+                path,
+                prefix_project,
+                _required_dimensions,
             )
         else:
-            _bind_request_attribution(request.scope, headers, path, prefix_project)
+            missing_attribution = _bind_request_attribution(
+                request.scope, headers, path, prefix_project, _required_dimensions
+            )
+        if missing_attribution:
+            from headroom.proxy.attribution_policy import attribution_error_payload
+
+            logger.info(
+                "event=attribution_refused transport=http path=%s missing=%s",
+                path,
+                ",".join(missing_attribution),
+            )
+            return JSONResponse(
+                status_code=400, content=attribution_error_payload(missing_attribution)
+            )
         client = getattr(request, "client", None)
         client_addr = ""
         if client is not None:

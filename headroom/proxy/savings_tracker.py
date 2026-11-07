@@ -911,6 +911,23 @@ def _normalize_dimensions(raw: Any) -> dict[str, dict[str, dict[str, Any]]]:
     return dimensions
 
 
+def _with_legacy_hosts(raw: Mapping[str, Any]) -> Any:
+    """``dimensions``, seeded from a pre-dimension ``hosts`` map when present.
+
+    An earlier per-host build persisted host totals under a top-level
+    ``hosts`` key with the project entry shape. Carry them into the ``host``
+    dimension once, so upgrading does not reset a machine's lifetime history;
+    a ``host`` dimension that already exists wins.
+    """
+    dimensions = raw.get("dimensions")
+    legacy = raw.get("hosts")
+    if not isinstance(legacy, dict) or not legacy:
+        return dimensions
+    merged = dict(dimensions) if isinstance(dimensions, dict) else {}
+    merged.setdefault("host", legacy)
+    return merged
+
+
 def _normalize_projects(raw: Any) -> dict[str, dict[str, Any]]:
     if not isinstance(raw, dict):
         return {}
@@ -2174,7 +2191,7 @@ class SavingsTracker:
             "display_session": _normalize_display_session(raw.get("display_session")),
             "history": normalized_history,
             "projects": _normalize_projects(raw.get("projects")),
-            "dimensions": _normalize_dimensions(raw.get("dimensions")),
+            "dimensions": _normalize_dimensions(_with_legacy_hosts(raw)),
             "by_model": _normalize_by_model(raw.get("by_model")),
         }
         raw_lifetime_metrics = raw.get("lifetime_metrics")

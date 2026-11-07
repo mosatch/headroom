@@ -503,6 +503,20 @@ SETTINGS: tuple[SettingField, ...] = (
         help="Comma-separated opt-in proxy extension entry-point names ('*' enables all discovered).",
         tier="advanced",
     ),
+    # --- Attribution ---
+    SettingField(
+        "HEADROOM_REQUIRE_DIMENSIONS",
+        "require_dimensions",
+        "Required attribution",
+        "Attribution",
+        "csv-list",
+        default=None,
+        help=(
+            "Refuse model requests without a client-sent label for these dimensions "
+            "(e.g. host,project). Operational endpoints are never affected."
+        ),
+        tier="advanced",
+    ),
     # --- Backend ---
     SettingField(
         "HEADROOM_NO_SUBSCRIPTION_TRACKING",
