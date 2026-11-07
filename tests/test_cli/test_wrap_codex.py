@@ -1248,7 +1248,12 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         assert content.count("[model_providers.headroom]") == 1
         assert content.count("env_http_headers") == 1
         assert 'base_url = "http://127.0.0.1:8787/v1"' in content
-        assert 'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }' in content
+        headers = tomllib.loads(content)["model_providers"]["headroom"]["env_http_headers"]
+        assert headers == {
+            "X-Headroom-Project": "HEADROOM_PROJECT",
+            "X-Headroom-Host": "HEADROOM_HOST_LABEL",
+            "X-Headroom-Labels": "HEADROOM_LABELS",
+        }
         assert "[profiles.default]" in content
         assert 'model = "gpt-5"' in content
 
@@ -1293,7 +1298,9 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         assert content.count("env_http_headers") == 1  # inline form from the injection
         assert parsed["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:8787/v1"
         assert parsed["model_providers"]["headroom"]["env_http_headers"] == {
-            "X-Headroom-Project": "HEADROOM_PROJECT"
+            "X-Headroom-Project": "HEADROOM_PROJECT",
+            "X-Headroom-Host": "HEADROOM_HOST_LABEL",
+            "X-Headroom-Labels": "HEADROOM_LABELS",
         }
         assert parsed["profiles"]["default"]["model"] == "gpt-5"
         assert parsed["notice"] == {"hide_rate_limit_model_nudge": True}
@@ -2460,7 +2467,12 @@ class TestCodexProjectHeaderConfig:
         wrap_mod._inject_codex_provider_config(8787)
 
         content = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
-        assert 'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }' in content
+        headers = tomllib.loads(content)["model_providers"]["headroom"]["env_http_headers"]
+        assert headers == {
+            "X-Headroom-Project": "HEADROOM_PROJECT",
+            "X-Headroom-Host": "HEADROOM_HOST_LABEL",
+            "X-Headroom-Labels": "HEADROOM_LABELS",
+        }
 
     def test_env_http_headers_inside_provider_section(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

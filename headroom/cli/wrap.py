@@ -3144,6 +3144,9 @@ def _codex_session_launch_settings(
 
     if project and "HEADROOM_PROJECT" not in env:
         env["HEADROOM_PROJECT"] = project
+    host_label = _host_name_for_header()
+    if host_label and _HOST_LABEL_ENV_VAR not in env:
+        env[_HOST_LABEL_ENV_VAR] = host_label
     # Routing is passed as ``--config`` so it stays scoped to this process, and
     # Codex runs any session with command-line overrides in embedded mode,
     # without its shared background server (#3888). Say so up front, and point
@@ -3436,6 +3439,71 @@ def _project_name_from_cwd() -> str | None:
     return urllib.parse.quote(name, safe="-_.() ")
 
 
+# Attribution headers beyond the project (headroom.proxy.attribution). A proxy
+# bound to a LAN address serves several machines; the client is the only party
+# that reliably knows its own name, so wrap reports it.
+_HOST_HEADER_NAME = "X-Headroom-Host"
+_LABELS_HEADER_NAME = "X-Headroom-Labels"
+# Deliberately NOT ``HEADROOM_HOST``: that is the proxy's own bind address
+# (``headroom proxy --host``), and reusing it would make a proxy launched from
+# this environment try to bind to the machine's name.
+_HOST_LABEL_ENV_VAR = "HEADROOM_HOST_LABEL"
+_LABELS_ENV_VAR = "HEADROOM_LABELS"
+
+
+def _host_name_for_header() -> str | None:
+    """Host label for X-Headroom-Host: ``HEADROOM_HOST_LABEL``, else the hostname.
+
+    Percent-encoded on the same rationale as the project label. The proxy
+    lowercases and strips a ``.local`` suffix, so the spelling the platform
+    happens to report does not split one machine into two.
+    """
+    name = os.environ.get(_HOST_LABEL_ENV_VAR, "").strip()
+    if not name:
+        try:
+            name = socket.gethostname().strip()
+        except Exception:
+            return None
+    if not name:
+        return None
+    return urllib.parse.quote(name, safe="-_.() ")
+
+
+def _labels_for_header() -> str | None:
+    """``HEADROOM_LABELS`` normalized for X-Headroom-Labels, or ``None``."""
+    from headroom.proxy.attribution import format_labels, parse_labels
+
+    labels = parse_labels(os.environ.get(_LABELS_ENV_VAR, ""))
+    if not labels:
+        return None
+    return urllib.parse.quote(format_labels(labels), safe="-_.() =;")
+
+
+def _apply_custom_header_env(env: dict[str, str], header_name: str, value: str | None) -> None:
+    """Append one ``Name: value`` line to ``ANTHROPIC_CUSTOM_HEADERS``.
+
+    A user-supplied header of the same name (any casing) wins; other user
+    headers are preserved.
+    """
+    if not value:
+        return
+    header_line = f"{header_name}: {value}"
+    existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    if existing:
+        for line in existing.splitlines():
+            if line.split(":", 1)[0].strip().lower() == header_name.lower():
+                return
+        env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}"
+    else:
+        env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
+
+
+def _apply_attribution_header_env(env: dict[str, str]) -> None:
+    """Inject X-Headroom-Host and X-Headroom-Labels (user override wins)."""
+    _apply_custom_header_env(env, _HOST_HEADER_NAME, _host_name_for_header())
+    _apply_custom_header_env(env, _LABELS_HEADER_NAME, _labels_for_header())
+
+
 def _project_cwd_from_cwd() -> str | None:
     """Return the canonical launch directory for X-Headroom-Cwd.
 
@@ -3672,7 +3740,14 @@ def _inject_codex_provider_config(port: int) -> str | None:
     # codex`) exists at Codex runtime. When a custom upstream was detected,
     # add a second entry so Codex also sends X-Headroom-Base-Url — the proxy
     # forwards there instead of api.openai.com (#1614).
-    env_http_headers_map = {_PROJECT_HEADER_NAME: "HEADROOM_PROJECT"}
+    env_http_headers_map = {
+        _PROJECT_HEADER_NAME: "HEADROOM_PROJECT",
+        # Attribution, same mechanism: Codex sends each header only while its
+        # variable is set. `headroom wrap codex` exports the host label; labels
+        # come from the user's own HEADROOM_LABELS.
+        _HOST_HEADER_NAME: _HOST_LABEL_ENV_VAR,
+        _LABELS_HEADER_NAME: _LABELS_ENV_VAR,
+    }
     if custom_upstream_base_url:
         env_http_headers_map[_UPSTREAM_BASE_URL_HEADER_NAME] = _UPSTREAM_BASE_URL_ENV_VAR
     env_http_headers_toml = ", ".join(f'"{k}" = "{v}"' for k, v in env_http_headers_map.items())
@@ -6439,6 +6514,9 @@ def claude(
         _apply_project_header_env(env)
         # Same token written into the marker above.
         _apply_session_token_header_env(env, _session_token)
+        # Host and label attribution, so a proxy shared across machines can
+        # tell its callers apart.
+        _apply_attribution_header_env(env)
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.

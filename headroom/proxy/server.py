@@ -118,6 +118,11 @@ from headroom.providers.registry import (
     resolve_api_targets,
 )
 from headroom.proxy import runtime_env
+from headroom.proxy.attribution import (
+    AttributionRequest,
+    resolve_attribution,
+    set_current_attribution,
+)
 from headroom.proxy.audit import is_auditable_path, record_admin_action
 from headroom.proxy.auth_mode import CLIENT_UA_MAP, should_stamp_codex_client
 from headroom.proxy.background_compression import BackgroundCompressor
@@ -3258,6 +3263,32 @@ class WebSocketAuthMiddleware:
             await send({"type": "websocket.close", "code": 1008})
 
 
+def _bind_request_attribution(
+    scope: Any, headers: Mapping[str, str], path: str, path_project: str | None
+) -> None:
+    """Resolve this request's attribution labels into the request context.
+
+    Runs where project attribution is captured, for HTTP and WebSocket alike.
+    Never raises: a failure leaves the request unattributed, as before.
+    """
+    try:
+        client = scope.get("client") if isinstance(scope, Mapping) else None
+        peer = client[0] if client else None
+        set_current_attribution(
+            resolve_attribution(
+                AttributionRequest(
+                    headers={str(k).lower(): v for k, v in headers.items()},
+                    path=path,
+                    peer=peer,
+                    path_project=path_project,
+                )
+            )
+        )
+    except Exception:  # noqa: BLE001 - attribution must never fail a request
+        logger.debug("attribution resolve failed", exc_info=True)
+        set_current_attribution(None)
+
+
 class WebSocketProjectPrefixMiddleware:
     """Normalize project-prefixed WebSocket paths before route matching."""
 
@@ -3271,6 +3302,7 @@ class WebSocketProjectPrefixMiddleware:
                 name.decode("latin-1"): value.decode("latin-1") for name, value in scope["headers"]
             }
             set_current_project(classify_project(headers) or prefix_project)
+            _bind_request_attribution(scope, headers, scope.get("path", ""), prefix_project)
         await self.app(scope, receive, send)
 
 
@@ -4199,6 +4231,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         if should_stamp_codex_client(path, headers):
             request.scope["headroom_codex_client_stamped"] = True
             request.scope["headers"].append((b"x-client", b"codex"))
+            _bind_request_attribution(
+                request.scope, {**headers, "x-client": "codex"}, path, prefix_project
+            )
+        else:
+            _bind_request_attribution(request.scope, headers, path, prefix_project)
         client = getattr(request, "client", None)
         client_addr = ""
         if client is not None:
@@ -4357,6 +4394,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # ordering contract above). Routes an extension registers are unaffected
     # by position. ``_proxy_token`` was read above, before extensions ran, so
     # an extension cannot change which credential the gate enforces.
+    # Attribution labels on OTel datapoints, when HEADROOM_OTEL_ATTRIBUTION
+    # asks for them (off by default; each label is a metric series).
+    try:
+        from headroom.proxy.attribution import install_otel_attribution
+
+        install_otel_attribution()
+    except Exception:  # noqa: BLE001 - observability must not block startup
+        logger.debug("OTel attribution provider not installed", exc_info=True)
+
     from headroom.proxy.extensions import install_all as _install_extensions
 
     _install_extensions(app, config, enabled=getattr(config, "proxy_extensions", None))
@@ -4780,6 +4826,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # (like its /dashboard/static assets) and stays reachable, so a container
     # published on host loopback, whose peer is the bridge gateway, still loads.
     _dashboard_gate = [Depends(_require_operator_read_client)]
+    # Same check for extension routes, which are registered before this gate
+    # exists and so call it at request time (raises 404 for other callers).
+    app.state.require_operator_read = _require_operator_read_client
 
     # Effective licence state of THIS proxy, resolved once: an explicit
     # ProxyConfig.license_key, else HEADROOM_LICENSE or its deprecated alias.
@@ -5300,6 +5349,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "savings": {
                 "total_tokens": total_tokens_all_layers,
                 "per_project": persistent_savings.get("projects", {}),
+                # Savings per attribution label ({dimension: {label: row}}).
+                # Host and team labels name machines and people, so unlike the
+                # long-standing per_project map these go to dashboard callers
+                # only (stripped in /stats below).
+                "by_dimension": persistent_savings.get("by_dimension", {}),
                 # Attribution only: these rows explain the canonical headline
                 # and are not added to it again.
                 "by_source": sorted(
@@ -5756,6 +5810,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # _build_stats_payload bakes these in; strip for network callers.
             payload.pop("recent_requests", None)
             payload.pop("request_logs", None)
+            savings_section = payload.get("savings")
+            if isinstance(savings_section, dict) and "by_dimension" in savings_section:
+                payload["savings"] = {
+                    k: v for k, v in savings_section.items() if k != "by_dimension"
+                }
         return payload
 
     @app.get("/stats-lifetime")
@@ -5768,6 +5827,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         if not include_sensitive:
             payload.pop("projects", None)
+            payload.pop("by_dimension", None)
             persistence = payload.get("persistence")
             if isinstance(persistence, dict):
                 payload["persistence"] = {**persistence, "error": None}

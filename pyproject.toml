@@ -420,6 +420,10 @@ sandbox = [
 headroom = "headroom.cli.main:main"
 headroom-cache-ttl = "headroom.cache.ttl_estimator:main"
 
+# Opt-in: enable with `--proxy-extension attribution`.
+[project.entry-points."headroom.proxy_extension"]
+attribution = "headroom.proxy.attribution_report:install"
+
 [project.urls]
 Homepage = "https://docs.headroomlabs.ai"
 Documentation = "https://docs.headroomlabs.ai/docs"
