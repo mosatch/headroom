@@ -4057,7 +4057,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     memory_context_inert_reason(
                         config.mode,
                         inject_context=bool(memory_status.get("inject_context", False)),
-                        memory_mode=memory_status.get("mode"),
+                        memory_mode=(
+                            mode if isinstance(mode := memory_status.get("mode"), str) else None
+                        ),
                     )
                     if memory_enabled
                     else None
